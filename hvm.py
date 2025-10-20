@@ -151,7 +151,7 @@ STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
 """
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder=os.path.abspath('.'))
 app.config['SECRET_KEY'] = SECRET_KEY
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -2938,6 +2938,19 @@ def show_banner():
 show_banner()
 
 
+def _find_available_port(preferred_port, max_tries=100):
+    """Try to find an available port starting from preferred_port.
+    Returns a usable port number. If none found in the range, returns 0 (OS-assigned)."""
+    for p in range(preferred_port, preferred_port + max_tries + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('0.0.0.0', p))
+                return p
+            except OSError:
+                continue
+    return 0
+
 if __name__ == '__main__':
     machine_id = hex(uuid.getnode())
     print(f"Your machine ID (provide to admin for license): {machine_id}")
@@ -2948,30 +2961,39 @@ if __name__ == '__main__':
         valid, msg_or_data = validate_license(activated_key)
         if valid:
             lic = db.get_license(activated_key)
-            if lic and lic['active'] and datetime.datetime.fromisoformat(lic['expires_at']) > datetime.datetime.now():
+            if lic and lic.get('active') and datetime.datetime.fromisoformat(lic['expires_at']) > datetime.datetime.now():
                 activated = True
 
-    if not activated:
-        print("This is the first run or license invalid. Enter valid license key to activate:")
-        while True:
-            new_key = input().strip()
-            valid, msg_or_data = validate_license(new_key)
-            if valid:
-                license_data = msg_or_data
-                lic = db.get_license(new_key)
-                if lic:
-                    if not lic['active']:
-                        print("License deactivated")
-                        continue
-                    if datetime.datetime.fromisoformat(lic['expires_at']) < datetime.datetime.now():
-                        print("License expired")
-                        continue
-                else:
-                    db.add_license(new_key, license_data['expires'])
-                db.set_setting('activated_license', new_key)
-                print("Activated successfully!")
-                break
-            else:
-                print(f"Invalid key: {msg_or_data}")
+    chosen_port = _find_available_port(SERVER_PORT, max_tries=100)
+    if chosen_port == 0:
+        print(f"Warning: no free ports in range {SERVER_PORT}-{SERVER_PORT+100}, requesting OS-assigned port")
+    elif chosen_port != SERVER_PORT:
+        print(f"Port {SERVER_PORT} is in use, switching to available port {chosen_port}")
+    else:
+        print(f"Using configured port {SERVER_PORT}")
 
-    socketio.run(app, host='0.0.0.0', port=SERVER_PORT, debug=DEBUG)
+    # Reserve the chosen port by binding a temporary socket first to avoid
+    # a race where another process takes the port between our check and the server start.
+    reserved_port = None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bind_port = chosen_port if chosen_port else 0
+            s.bind(('0.0.0.0', bind_port))
+            reserved_port = s.getsockname()[1]
+            # close the socket to let the server bind to it
+        print(f"Starting server on port {reserved_port}")
+        socketio.run(app, host='0.0.0.0', port=reserved_port, debug=DEBUG)
+    except OSError as e:
+        logger.error(f"Failed to start server on port {chosen_port or 0}: {e}")
+        # Try OS-assigned port as fallback
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('0.0.0.0', 0))
+                reserved_port = s.getsockname()[1]
+            print(f"Falling back to OS-assigned port {reserved_port}")
+            socketio.run(app, host='0.0.0.0', port=reserved_port, debug=DEBUG)
+        except Exception:
+            logger.exception("Unable to start server on any port")
+            raise
