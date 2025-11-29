@@ -1015,33 +1015,52 @@ def get_or_pull_image(base_image=DEFAULT_OS_IMAGE, timeout=60):
 
 def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, timeout=600):
     """
-    Build custom Docker image ONLY when dockerfile_content is provided.
-    For standard images, use get_or_pull_image() instead.
+    Build Docker image with systemd support.
+    If dockerfile_content is None, uses DOCKERFILE_TEMPLATE (includes systemd).
+    If dockerfile_content is provided, uses custom dockerfile.
     Returns image tag or raises exception.
     """
-    # If no custom dockerfile, just use the base image directly
-    if not dockerfile_content:
-        return get_or_pull_image(base_image, timeout=60)
-    
-    # Only build if custom dockerfile is provided
     with image_build_lock:
-        image_tag = f"hvm/{base_image.replace(':', '-').lower()}-custom:latest"
+        # Check if image already exists
+        existing = db.get_image(base_image)
+        if existing:
+            try:
+                docker_client.images.get(existing['image_id'])
+                logger.info(f"Using existing built image: {existing['image_id']}")
+                return existing['image_id']
+            except docker.errors.ImageNotFound:
+                db._execute('DELETE FROM docker_images WHERE os_image = ?', (base_image,))
         
-        # Check if custom image already exists
+        # Image tag for built images with systemd
+        image_tag = f"hvm/{base_image.replace(':', '-').lower()}:latest"
+        
+        # Check if built image already exists
         try:
             docker_client.images.get(image_tag)
-            logger.info(f"Using existing custom image: {image_tag}")
+            logger.info(f"Using existing built image: {image_tag}")
+            db.add_image({
+                'image_id': image_tag,
+                'os_image': base_image,
+                'created_at': str(datetime.datetime.now())
+            })
             return image_tag
         except docker.errors.ImageNotFound:
             pass
         
         temp_dir = None
         try:
-            temp_dir = f"image_cache/{base_image.replace(':', '-')}-custom"
+            temp_dir = f"image_cache/{base_image.replace(':', '-')}"
             os.makedirs(temp_dir, exist_ok=True)
            
-            with open(os.path.join(temp_dir, 'Dockerfile'), 'w') as f:
-                f.write(dockerfile_content)
+            # Use custom dockerfile if provided, otherwise use template with systemd
+            if dockerfile_content:
+                with open(os.path.join(temp_dir, 'Dockerfile'), 'w') as f:
+                    f.write(dockerfile_content)
+            else:
+                # Use DOCKERFILE_TEMPLATE which includes systemd
+                dockerfile = DOCKERFILE_TEMPLATE.format(base_image=base_image)
+                with open(os.path.join(temp_dir, 'Dockerfile'), 'w') as f:
+                    f.write(dockerfile)
            
             # Build with timeout using threading
             build_result = {'image': None, 'error': None, 'logs': []}
@@ -1065,7 +1084,7 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, tim
             build_thread_obj.join(timeout=timeout)
             
             if build_thread_obj.is_alive():
-                raise TimeoutError(f"Custom image build timed out after {timeout} seconds")
+                raise TimeoutError(f"Image build timed out after {timeout} seconds")
             
             if build_result['error']:
                 raise build_result['error']
@@ -1086,7 +1105,7 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, tim
            
             return image_tag
         except Exception as e:
-            logger.error(f"Custom image build error: {e}")
+            logger.error(f"Image build error: {e}")
             raise
         finally:
             if temp_dir and os.path.exists(temp_dir):
@@ -1104,28 +1123,152 @@ def setup_container(container_id, memory, vps_id, ssh_port, root_password, water
         container = docker_client.containers.get(container_id)
         if container.status != "running":
             container.start()
-            # Wait for container to be ready (with timeout) - reduced wait time
-            max_wait = 10
-            waited = 0
-            while waited < max_wait:
-                try:
-                    container.reload()
-                    if container.status == "running":
-                        break
-                    time.sleep(0.5)  # Reduced sleep time
-                    waited += 0.5
-                except Exception:
-                    if waited >= max_wait:
-                        raise Exception("Container failed to start")
-                    time.sleep(0.5)
-                    waited += 0.5
         
-        # Critical: Set root password (with short timeout)
+        # Wait for container to be fully ready (handle restarting state)
+        max_wait = 60  # Increased wait time for restarting containers
+        waited = 0
+        container_ready = False
+        last_status = None
+        
+        while waited < max_wait:
+            try:
+                container.reload()
+                current_status = container.status
+                
+                # Handle restarting containers - wait for them to stabilize
+                if current_status == "restarting":
+                    logger.info(f"Container {container_id[:12]} is restarting, waiting for it to stabilize...")
+                    time.sleep(2)
+                    waited += 2
+                    continue
+                
+                # If container exited, check logs and raise error
+                if current_status == "exited":
+                    try:
+                        logs = container.logs(tail=20).decode('utf-8', errors='ignore')
+                        logger.error(f"Container exited. Logs: {logs[-500:]}")
+                    except:
+                        pass
+                    raise Exception("Container exited immediately after start. Check container logs.")
+                
+                # If container is running, test if exec works
+                if current_status == "running":
+                    # Wait a bit for systemd to initialize
+                    time.sleep(2)
+                    
+                    # Try a simple command to verify container is ready for exec
+                    try:
+                        test_result = container.exec_run(["echo", "test"], timeout=5)
+                        if test_result.exit_code == 0:
+                            container_ready = True
+                            break
+                    except docker.errors.APIError as e:
+                        if "is restarting" in str(e):
+                            logger.info("Container still restarting, waiting...")
+                            time.sleep(2)
+                            waited += 2
+                            continue
+                        raise
+                    except Exception:
+                        # Container not ready for exec yet, wait more
+                        pass
+                
+                # Track status changes
+                if current_status != last_status:
+                    logger.info(f"Container status: {current_status}")
+                    last_status = current_status
+                
+                time.sleep(1)
+                waited += 1
+            except docker.errors.APIError as e:
+                if "is restarting" in str(e):
+                    logger.info("Container is restarting, waiting...")
+                    time.sleep(3)
+                    waited += 3
+                    continue
+                logger.warning(f"Container readiness check error: {e}")
+                if waited >= max_wait:
+                    raise Exception(f"Container failed to start or become ready: {e}")
+                time.sleep(1)
+                waited += 1
+            except Exception as e:
+                logger.warning(f"Container readiness check error: {e}")
+                if waited >= max_wait:
+                    raise Exception(f"Container failed to start or become ready: {e}")
+                time.sleep(1)
+                waited += 1
+        
+        if not container_ready:
+            # Get container logs for debugging
+            try:
+                logs = container.logs(tail=50).decode('utf-8', errors='ignore')
+                logger.error(f"Container not ready. Last 50 lines of logs:\n{logs}")
+            except:
+                pass
+            raise Exception("Container did not become ready for commands within timeout")
+        
+        # Wait a bit more for systemd/services to fully initialize
+        time.sleep(5)
+        
+        # Critical: Set root password (with retry logic)
         whole = shlex.quote(f"root:{root_password}")
         cmd = f"echo {whole} | chpasswd"
-        success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=15)
-        if not success:
-            raise Exception(f"Password set failed: {stderr}")
+        
+        # Retry password setup up to 5 times (handle restarting containers)
+        password_set = False
+        last_error = None
+        for attempt in range(5):
+            try:
+                # Check container status before each attempt
+                container.reload()
+                if container.status == "restarting":
+                    logger.info(f"Container restarting, waiting before password setup attempt {attempt + 1}")
+                    time.sleep(5)
+                    continue
+                if container.status != "running":
+                    raise Exception(f"Container status is {container.status}, not running")
+                
+                success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=20)
+                if success:
+                    password_set = True
+                    break
+                else:
+                    last_error = stderr
+                    # Check if it's a restarting error
+                    if "restarting" in stderr.lower() or "409" in stderr:
+                        logger.info(f"Container restarting during password setup, retrying... (attempt {attempt + 1}/5)")
+                        time.sleep(5)
+                        continue
+                    if "unable to upgrade" not in stderr:
+                        # Non-retryable error
+                        break
+                    time.sleep(3)  # Wait before retry
+            except docker.errors.APIError as e:
+                if "restarting" in str(e).lower():
+                    logger.info(f"Container restarting, waiting... (attempt {attempt + 1}/5)")
+                    time.sleep(5)
+                    continue
+                last_error = str(e)
+                if "409" not in str(e) and "unable to upgrade" not in str(e):
+                    break
+                time.sleep(3)
+            except Exception as e:
+                last_error = str(e)
+                if "restarting" in str(e).lower():
+                    time.sleep(5)
+                    continue
+                if "409" not in str(e) and "unable to upgrade" not in str(e):
+                    break
+                time.sleep(3)
+        
+        if not password_set:
+            # Get container logs for debugging
+            try:
+                logs = container.logs(tail=30).decode('utf-8', errors='ignore')
+                logger.error(f"Password setup failed. Container logs:\n{logs}")
+            except:
+                pass
+            raise Exception(f"Password set failed after retries: {last_error}")
        
         # Non-critical operations - run in background to speed up VPS creation
         def setup_non_critical():
@@ -1463,22 +1606,33 @@ def create_vps():
                     # Only build if custom dockerfile provided
                     image_tag = build_custom_image(os_image, dockerfile_content, timeout=600)
                 else:
-                    # Use pre-built image if available, otherwise build (with timeout)
+                    # ALWAYS build image with systemd - never use base images directly
                     # Check if pre-built exists first
                     existing = db.get_image(os_image)
                     if existing:
                         try:
-                            docker_client.images.get(existing['image_id'])
-                            image_tag = existing['image_id']
-                            logger.info(f"Using pre-built image: {image_tag}")
+                            existing_image = docker_client.images.get(existing['image_id'])
+                            # Verify it's a built image (starts with hvm/)
+                            if existing['image_id'].startswith('hvm/'):
+                                image_tag = existing['image_id']
+                                logger.info(f"Using pre-built image with systemd: {image_tag}")
+                            else:
+                                # Existing image is base image, rebuild with systemd
+                                logger.warning(f"Existing image {existing['image_id']} is base image, rebuilding with systemd...")
+                                image_tag = build_custom_image(os_image, None, timeout=300)
                         except docker.errors.ImageNotFound:
                             # Pre-built doesn't exist, build it now
-                            logger.info(f"Pre-built image not found, building: {os_image}")
+                            logger.info(f"Pre-built image not found, building with systemd: {os_image}")
                             image_tag = build_custom_image(os_image, None, timeout=300)
                     else:
-                        # Not pre-built, build it now (with shorter timeout since it's blocking)
-                        logger.info(f"Building image: {os_image}")
+                        # Not pre-built, build it now with systemd
+                        logger.info(f"Building image with systemd: {os_image}")
                         image_tag = build_custom_image(os_image, None, timeout=300)
+                    
+                    # Final verification - ensure we're using built image
+                    if not image_tag.startswith('hvm/'):
+                        logger.error(f"ERROR: Image tag {image_tag} is not a built image! This will cause container failures.")
+                        raise ValueError(f'Invalid image: {image_tag}. Must use built image with systemd.')
             except TimeoutError as e:
                 logger.error(f"Image operation timeout: {e}")
                 raise ValueError('Image build timed out. Common images are being pre-built in background. Please try again in a few minutes.')
@@ -1490,6 +1644,13 @@ def create_vps():
             try:
                 cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
                 prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+                
+                # CRITICAL: Verify we're using the built image with systemd, not base image
+                if not image_tag.startswith('hvm/'):
+                    logger.error(f"CRITICAL ERROR: Image tag {image_tag} is not a built image! Expected format: hvm/ubuntu-22.04:latest")
+                    raise ValueError(f'Invalid image: {image_tag}. Must use built image with systemd (format: hvm/os-image:latest)')
+                
+                logger.info(f"Creating container with image: {image_tag}")
                 
                 # Create container with timeout
                 container = None
@@ -1507,9 +1668,18 @@ def create_vps():
                         network=DOCKER_NETWORK,
                         volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
                         restart_policy={"Name": "always"},
-                        ports=ports
+                        ports=ports,
+                        command=None  # Use image's default CMD (/sbin/init)
                     )
                     container_id = container.id
+                    logger.info(f"Container created: {container_id[:12]}")
+                    
+                    # Force start if container is only created
+                    container.reload()
+                    if container.status == "created":
+                        logger.info("Container is in 'created' state, starting it...")
+                        container.start()
+                        container.reload()
                 except docker.errors.APIError as e:
                     logger.error(f"Docker API error: {e}")
                     raise ValueError(f'Docker API error: {str(e)}')
@@ -1517,22 +1687,89 @@ def create_vps():
                     logger.error(f"Container creation failed: {e}")
                     raise ValueError(f'Failed to create container: {str(e)}')
                 
-                # Wait for container to be ready (with timeout)
-                max_wait = 30  # Maximum wait time in seconds
+                # Wait for container to start (handle restarting state)
+                max_wait = 45  # Maximum wait time in seconds
                 waited = 0
+                started = False
+                
                 while waited < max_wait:
                     try:
                         container.reload()
-                        if container.status in ['running', 'created']:
+                        status = container.status
+                        
+                        if status == "restarting":
+                            logger.info(f"Container {container_id[:12]} is restarting, waiting for stabilization...")
+                            time.sleep(3)
+                            waited += 3
+                            continue
+                        
+                        if status == "exited":
+                            # Container exited immediately - check logs
+                            try:
+                                logs = container.logs(tail=30).decode('utf-8', errors='ignore')
+                                logger.error(f"Container exited immediately. Logs: {logs}")
+                            except:
+                                pass
+                            raise ValueError('Container exited immediately after creation. The image may not support systemd.')
+                        
+                        if status == "running":
+                            # Container is running, wait a bit for it to stabilize
+                            time.sleep(2)
+                            started = True
                             break
+                        
+                        # Allow "created" status for a short time
+                        # If container is created but not started, start it
+                        if status == "created":
+                            logger.info("Container is in 'created' state, starting it...")
+                            try:
+                                container.start()
+                                container.reload()
+                                status = container.status
+                            except Exception as e:
+                                logger.error(f"Failed to start container: {e}")
+                                if waited >= max_wait:
+                                    raise ValueError(f'Failed to start container: {e}')
+                                time.sleep(1)
+                                waited += 1
+                                continue
+                        
+                        # Allow short wait for created containers
+                        if status == "created" and waited < 5:
+                            time.sleep(1)
+                            waited += 1
+                            continue
+                        
+                        time.sleep(1)
+                        waited += 1
+                    except docker.errors.APIError as e:
+                        if "restarting" in str(e).lower():
+                            logger.info("Container restarting, waiting...")
+                            time.sleep(3)
+                            waited += 3
+                            continue
+                        logger.warning(f"Container reload attempt failed: {e}")
+                        if waited >= max_wait:
+                            raise ValueError(f'Container failed to start in time: {e}')
                         time.sleep(1)
                         waited += 1
                     except Exception as e:
-                        logger.warning(f"Container reload attempt failed: {e}")
+                        if "exited" in str(e).lower():
+                            raise
+                        logger.warning(f"Container wait error: {e}")
                         if waited >= max_wait:
-                            raise ValueError('Container failed to start in time')
+                            raise ValueError(f'Container failed to start in time: {e}')
                         time.sleep(1)
                         waited += 1
+                
+                if not started:
+                    # Get container logs for debugging
+                    try:
+                        logs = container.logs(tail=50).decode('utf-8', errors='ignore')
+                        logger.error(f"Container failed to start. Logs: {logs}")
+                    except:
+                        pass
+                    raise ValueError('Container did not start within timeout period')
                 
                 if waited >= max_wait:
                     raise ValueError('Container did not start within timeout period')
