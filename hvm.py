@@ -46,25 +46,43 @@ import shlex
 import base64
 from ecdsa import VerifyingKey, BadSignatureError, NIST384p
 
+IS_LINUX = sys.platform.startswith("linux")
+
 PUBLIC_HEX = 'b681f4f051055d844c3f21678db26759adacf292fc649b49e08800b316173927aa08df82ad4a9a9930e26315ddc8531671ba42cdf16e91c086ce30150b6470cb37f390da3b3ec6522bed24cb1703efff9a0c8ec8d744222657e1944f5a08d81e'
 
 # Removed unused imports: pytz, requests (duplicate), bcrypt, matplotlib, pandas, seaborn, base64
 
 def check_docker_installed():
+    """Return True if the docker CLI is available."""
     try:
         subprocess.run(["docker", "--version"], check=True, capture_output=True)
         return True
-    except:
+    except Exception:
         return False
 
 def check_docker_running():
+    """Return True if the Docker daemon is reachable."""
     try:
         subprocess.run(["docker", "info"], check=True, capture_output=True)
         return True
-    except:
+    except Exception:
         return False
 
 def install_docker():
+    """
+    Best-effort Docker install helper.
+
+    NOTE: This script was originally written for Linux servers.
+    On non-Linux systems (like Windows without WSL), automatic
+    installation is not supported; the panel will keep running
+    but VPS features will be disabled until Docker is installed
+    and running manually.
+    """
+    if not IS_LINUX:
+        print("Automatic Docker installation is only supported on Linux. "
+              "Please install Docker Desktop / Docker manually.")
+        return False
+
     try:
         response = requests.get("https://get.docker.com")
         with open("get-docker.sh", "w") as f:
@@ -79,11 +97,15 @@ def install_docker():
         return False
 
 if not check_docker_installed():
-    if not install_docker():
-        sys.exit(1)
+    # Do NOT hard-exit here; allow the web UI to run so the user
+    # can still log in and see a clear "Docker unavailable" message.
+    install_docker()
 
-if not check_docker_running():
-    subprocess.run(["systemctl", "start", "docker"], check=True)
+if IS_LINUX and check_docker_installed() and not check_docker_running():
+    try:
+        subprocess.run(["systemctl", "start", "docker"], check=True)
+    except Exception as e:
+        print(f"Warning: failed to start Docker via systemctl: {e}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1214,18 +1236,31 @@ def create_vps():
     users = db.get_all_users()
 
     if request.method == 'POST':
+        container = None
+        container_id = None
+        vps_id = None
         try:
-            memory = int(request.form['memory'])
-            cpu = int(request.form['cpu'])
-            disk = int(request.form['disk'])
+            # Validate and parse input
+            try:
+                memory = int(request.form['memory'])
+                cpu = int(request.form['cpu'])
+                disk = int(request.form['disk'])
+            except (ValueError, KeyError) as e:
+                raise ValueError(f'Invalid resource values: {e}')
+
             os_image = request.form.get('os_image', DEFAULT_OS_IMAGE)
             additional_ports = request.form.get('additional_ports', '')
-            expires_days = int(request.form.get('expires_days', 30))
-            expires_hours = int(request.form.get('expires_hours', 0))
-            expires_minutes = int(request.form.get('expires_minutes', 0))
-            bandwidth_limit = int(request.form.get('bandwidth_limit', 0))
+            
+            try:
+                expires_days = int(request.form.get('expires_days', 30))
+                expires_hours = int(request.form.get('expires_hours', 0))
+                expires_minutes = int(request.form.get('expires_minutes', 0))
+                bandwidth_limit = int(request.form.get('bandwidth_limit', 0))
+                user_id = int(request.form.get('user_id', current_user.id))
+            except (ValueError, TypeError) as e:
+                raise ValueError(f'Invalid numeric values: {e}')
+
             tags = request.form.get('tags', '')
-            user_id = int(request.form.get('user_id', current_user.id))
 
             if memory < 1 or memory > 51200 or cpu < 1 or cpu > 320 or disk < 10 or disk > 100000:
                 raise ValueError('Invalid resources')
@@ -1240,73 +1275,122 @@ def create_vps():
             if db.get_user_vps_count(user_id) >= int(db.get_setting('max_vps_per_user', MAX_VPS_PER_USER)):
                 raise ValueError('Max VPS reached')
 
-            if len(docker_client.containers.list(all=True)) >= int(db.get_setting('max_containers', MAX_CONTAINERS)):
-                raise ValueError('Max containers reached')
+            try:
+                container_count = len(docker_client.containers.list(all=True))
+                if container_count >= int(db.get_setting('max_containers', MAX_CONTAINERS)):
+                    raise ValueError('Max containers reached')
+            except Exception as e:
+                logger.error(f"Error checking container count: {e}")
+                raise ValueError('Unable to check container limits')
 
             vps_id = generate_vps_id()
             token = generate_token()
             root_password = generate_ssh_password()
 
+            # Collect used ports
             used_ports = set()
-            for v in db.get_all_vps().values():
-                used_ports.add(v['port'])
-                for p in v.get('additional_ports', '').split(','):
-                    if p:
-                        used_ports.add(int(p.split(':')[0]))
+            try:
+                for v in db.get_all_vps().values():
+                    if v.get('port'):
+                        used_ports.add(v['port'])
+                    for p in v.get('additional_ports', '').split(','):
+                        if p and ':' in p:
+                            try:
+                                used_ports.add(int(p.split(':')[0]))
+                            except (ValueError, IndexError):
+                                continue
+            except Exception as e:
+                logger.warning(f"Error collecting used ports: {e}")
 
+            # Find available SSH port
             ssh_port = random.randint(20000, 30000)
-            while ssh_port in used_ports:
+            attempts = 0
+            while ssh_port in used_ports and attempts < 100:
                 ssh_port = random.randint(20000, 30000)
+                attempts += 1
+            if attempts >= 100:
+                raise ValueError('Unable to find available port')
 
+            # Parse additional ports
             ports = {'22/tcp': ssh_port}
-            for port_str in additional_ports.split(','):
-                if port_str.strip():
-                    host, cont = port_str.strip().split(':')
-                    host_p = int(host)
-                    if host_p in used_ports:
-                        raise ValueError(f"Port {host_p} in use")
-                    ports[f'{cont}/tcp'] = host_p
-                    used_ports.add(host_p)
+            if additional_ports:
+                for port_str in additional_ports.split(','):
+                    if port_str.strip():
+                        try:
+                            if ':' not in port_str:
+                                raise ValueError(f'Invalid port format: {port_str}')
+                            host, cont = port_str.strip().split(':')
+                            host_p = int(host)
+                            if host_p in used_ports:
+                                raise ValueError(f"Port {host_p} in use")
+                            ports[f'{cont}/tcp'] = host_p
+                            used_ports.add(host_p)
+                        except (ValueError, IndexError) as e:
+                            raise ValueError(f'Invalid port format "{port_str}": {e}')
 
+            # Handle custom dockerfile
             dockerfile_content = None
             if 'custom_dockerfile' in request.files:
                 file = request.files['custom_dockerfile']
                 if file and allowed_file(file.filename):
-                    dockerfile_content = file.read().decode('utf-8')
+                    try:
+                        dockerfile_content = file.read().decode('utf-8')
+                    except Exception as e:
+                        logger.warning(f"Error reading dockerfile: {e}")
 
-            image_tag = build_custom_image(os_image, dockerfile_content)
+            # Build image
+            try:
+                image_tag = build_custom_image(os_image, dockerfile_content)
+            except Exception as e:
+                logger.error(f"Image build failed: {e}")
+                raise ValueError(f'Failed to build image: {str(e)}')
 
-            cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
-            prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
-            container = docker_client.containers.run(
-                image_tag,
-                detach=True,
-                privileged=True,
-                hostname=f"{prefix}{vps_id}",
-                mem_limit=f"{memory}g",
-                nano_cpus=cpu * 10**9,
-                cpuset_cpus=cpuset,
-                cap_add=["SYS_ADMIN", "NET_ADMIN"],
-                security_opt=["seccomp=unconfined"],
-                network=DOCKER_NETWORK,
-                volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
-                restart_policy={"Name": "always"},
-                ports=ports
-            )
+            # Create container
+            try:
+                cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
+                prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+                container = docker_client.containers.run(
+                    image_tag,
+                    detach=True,
+                    privileged=True,
+                    hostname=f"{prefix}{vps_id}",
+                    mem_limit=f"{memory}g",
+                    nano_cpus=cpu * 10**9,
+                    cpuset_cpus=cpuset,
+                    cap_add=["SYS_ADMIN", "NET_ADMIN"],
+                    security_opt=["seccomp=unconfined"],
+                    network=DOCKER_NETWORK,
+                    volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
+                    restart_policy={"Name": "always"},
+                    ports=ports
+                )
+                container_id = container.id
+            except Exception as e:
+                logger.error(f"Container creation failed: {e}")
+                raise ValueError(f'Failed to create container: {str(e)}')
 
-            time.sleep(5)
-            container.reload()
+            # Wait for container to be ready
+            try:
+                time.sleep(5)
+                container.reload()
+            except Exception as e:
+                logger.warning(f"Container reload failed: {e}")
 
+            # Setup container
             watermark = db.get_setting('watermark', WATERMARK)
             welcome = db.get_setting('welcome_message', WELCOME_MESSAGE)
             setup_success, _ = setup_container(container.id, memory, vps_id, ssh_port, root_password, watermark, welcome)
             if not setup_success:
-                container.stop()
-                container.remove()
-                raise Exception('Setup failed')
+                raise Exception('Container setup failed')
 
-            tmate = get_tmate_session(container.id)
+            # Get tmate session (non-critical)
+            tmate = None
+            try:
+                tmate = get_tmate_session(container.id)
+            except Exception as e:
+                logger.warning(f"Tmate session failed: {e}")
 
+            # Prepare VPS data
             now = datetime.datetime.now()
             expires_at = now + datetime.timedelta(days=expires_days, hours=expires_hours, minutes=expires_minutes)
 
@@ -1323,7 +1407,7 @@ def create_vps():
                 'root_password': root_password,
                 'created_by': user_id,
                 'created_at': str(now),
-                'tmate_session': tmate,
+                'tmate_session': tmate or '',
                 'watermark': watermark,
                 'os_image': os_image,
                 'restart_count': 0,
@@ -1340,30 +1424,68 @@ def create_vps():
                 'tags': tags
             }
 
-            if db.add_vps(vps_data):
-                db.log_action(current_user.id, 'create_vps', f'Created VPS {vps_id}')
-                db.add_notification(user_id, f'New VPS {vps_id} created')
+            # Add to database
+            if not db.add_vps(vps_data):
+                raise Exception('Failed to save VPS to database')
+
+            # Success - log and notify
+            db.log_action(current_user.id, 'create_vps', f'Created VPS {vps_id}')
+            db.add_notification(user_id, f'New VPS {vps_id} created')
+            try:
                 user = db.get_user_by_id(user_id)
-                if user.get('email'):
+                if user and user.get('email'):
                     send_email(user['email'], 'VPS Created', f'Your new VPS {vps_id} is ready.')
-                resource_history[vps_id] = deque(maxlen=3600)
-                return render_template(
-                    'vps_created.html',
-                    vps=vps_data,
-                    server_ip=db.get_setting('server_ip', SERVER_IP),
-                    panel_name=db.get_setting('panel_name', PANEL_NAME),
-                    theme=current_user.theme
-                )
-            else:
-                container.stop()
-                container.remove()
-                raise Exception('DB add failed')
+            except Exception as e:
+                logger.warning(f"Email notification failed: {e}")
+
+            resource_history[vps_id] = deque(maxlen=3600)
+            return render_template(
+                'vps_created.html',
+                vps=vps_data,
+                server_ip=db.get_setting('server_ip', SERVER_IP),
+                panel_name=db.get_setting('panel_name', PANEL_NAME),
+                theme=current_user.theme
+            )
 
         except Exception as e:
-            logger.error(f"Create VPS error: {e}")
+            logger.error(f"Create VPS error: {e}", exc_info=True)
+            
+            # Cleanup: remove container if it was created
+            if container:
+                try:
+                    if container.status != 'exited':
+                        container.stop(timeout=10)
+                except Exception as cleanup_error:
+                    logger.warning(f"Error stopping container: {cleanup_error}")
+                try:
+                    container.remove(force=True)
+                except Exception as cleanup_error:
+                    logger.warning(f"Error removing container: {cleanup_error}")
+            elif container_id:
+                # Container was created but we lost the reference
+                try:
+                    cleanup_container = docker_client.containers.get(container_id)
+                    cleanup_container.stop(timeout=10)
+                    cleanup_container.remove(force=True)
+                except Exception as cleanup_error:
+                    logger.warning(f"Error cleaning up container {container_id}: {cleanup_error}")
+
+            # Cleanup: remove volume if created
+            if vps_id:
+                try:
+                    volume = docker_client.volumes.get(f'hvm-{vps_id}')
+                    volume.remove(force=True)
+                except Exception:
+                    pass  # Volume might not exist, ignore
+
+            # Return error to user
+            error_message = str(e)
+            if not error_message:
+                error_message = 'An unexpected error occurred while creating the VPS'
+            
             return render_template(
                 'create_vps.html',
-                error=str(e),
+                error=error_message,
                 panel_name=db.get_setting('panel_name', PANEL_NAME),
                 os_images=os_images,
                 users=users,
