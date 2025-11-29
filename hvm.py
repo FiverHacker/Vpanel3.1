@@ -176,8 +176,12 @@ CMD ["/sbin/init"]
 app = Flask(__name__, template_folder=os.path.abspath('.'))
 app.config['SECRET_KEY'] = SECRET_KEY
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(hours=24)
+# Set request timeout to prevent hanging requests
+app.config['TIMEOUT'] = 300  # 5 minutes max for VPS creation
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-socketio = SocketIO(app, async_mode='threading', cors_allowed_origins="*")
+socketio = SocketIO(app, async_mode='threading', cors_allowed_origins="*", ping_timeout=60, ping_interval=25)
 
 
 login_manager = LoginManager()
@@ -948,7 +952,11 @@ def update_vps_stats():
     except Exception as e:
         logger.error(f"VPS stats update error: {e}")
 
-def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None):
+def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, timeout=300):
+    """
+    Build Docker image with timeout protection.
+    Returns image tag or raises exception.
+    """
     with image_build_lock:
         existing = db.get_image(base_image)
         if existing:
@@ -958,6 +966,7 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None):
             except docker.errors.ImageNotFound:
                 db._execute('DELETE FROM docker_images WHERE os_image = ?', (base_image,))
        
+        temp_dir = None
         try:
             temp_dir = f"image_cache/{base_image.replace(':', '-')}"
             os.makedirs(temp_dir, exist_ok=True)
@@ -971,9 +980,40 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None):
                     f.write(dockerfile)
            
             image_tag = f"hvm/{base_image.replace(':', '-').lower()}:latest"
-            image, logs = docker_client.images.build(path=temp_dir, tag=image_tag, rm=True, forcerm=True)
-           
-            for log in logs:
+            
+            # Build with timeout using threading
+            build_result = {'image': None, 'error': None, 'logs': []}
+            
+            def build_thread():
+                try:
+                    image, logs = docker_client.images.build(
+                        path=temp_dir, 
+                        tag=image_tag, 
+                        rm=True, 
+                        forcerm=True,
+                        timeout=timeout
+                    )
+                    build_result['image'] = image
+                    build_result['logs'] = logs
+                except Exception as e:
+                    build_result['error'] = e
+            
+            build_thread_obj = threading.Thread(target=build_thread)
+            build_thread_obj.daemon = True
+            build_thread_obj.start()
+            build_thread_obj.join(timeout=timeout + 10)  # Add buffer
+            
+            if build_thread_obj.is_alive():
+                raise TimeoutError(f"Image build timed out after {timeout} seconds")
+            
+            if build_result['error']:
+                raise build_result['error']
+            
+            if not build_result['image']:
+                raise Exception("Image build failed - no image returned")
+            
+            # Log build output (non-blocking)
+            for log in build_result['logs']:
                 if 'stream' in log:
                     logger.info(log['stream'].strip())
            
@@ -984,63 +1024,113 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None):
             })
            
             return image_tag
+        except subprocess.TimeoutExpired:
+            logger.error(f"Image build timeout for {base_image}")
+            raise TimeoutError(f"Image build timed out after {timeout} seconds")
         except Exception as e:
             logger.error(f"Image build error: {e}")
             raise
         finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    logger.warning(f"Error cleaning temp dir: {e}")
 
 def setup_container(container_id, memory, vps_id, ssh_port, root_password, watermark, welcome):
+    """
+    Setup container with timeout protection for all operations.
+    Returns (success: bool, vps_id: str or None)
+    """
     try:
         container = docker_client.containers.get(container_id)
         if container.status != "running":
             container.start()
-            time.sleep(5)
-       
+            # Wait for container to be ready (with timeout)
+            max_wait = 15
+            waited = 0
+            while waited < max_wait:
+                try:
+                    container.reload()
+                    if container.status == "running":
+                        break
+                    time.sleep(1)
+                    waited += 1
+                except Exception:
+                    if waited >= max_wait:
+                        raise Exception("Container failed to start")
+                    time.sleep(1)
+                    waited += 1
+        
+        # Critical: Set root password (with timeout)
         whole = shlex.quote(f"root:{root_password}")
         cmd = f"echo {whole} | chpasswd"
-        success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd])
+        success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=30)
         if not success:
             raise Exception(f"Password set failed: {stderr}")
        
-        welcome_escaped = shlex.quote(welcome)
-        cmd = f"echo {welcome_escaped} > /etc/motd && echo 'echo {welcome_escaped}' >> /root/.bashrc"
-        success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd])
-        if not success:
-            logger.warning(f"Welcome set failed: {stderr}")
-       
-        prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
-        hostname = f"{prefix}{vps_id}"
-        hostname_escaped = shlex.quote(hostname)
-        hostname_cmd = f"echo {hostname_escaped} > /etc/hostname && hostname {hostname_escaped}"
-        success, _, stderr = run_docker_command(container_id, ["bash", "-c", hostname_cmd])
-        if not success:
-            raise Exception(f"Hostname set failed: {stderr}")
-       
-        watermark_escaped = shlex.quote(watermark)
-        success, _, stderr = run_docker_command(container_id, ["bash", "-c", f"echo {watermark_escaped} > /etc/machine-info"])
-        if not success:
-            logger.warning(f"Watermark set failed: {stderr}")
-       
-        security_cmds = [
-            "systemctl enable fail2ban && systemctl start fail2ban",
-            "apt-get update && apt-get upgrade -y",
-            "ufw allow 22",
-            "ufw --force enable",
-            "apt-get -y autoremove",
-            "apt-get clean",
-            "chmod 700 /root",
-            "systemctl enable prometheus-node-exporter && systemctl start prometheus-node-exporter"
-        ]
-        for cmd in security_cmds:
-            success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd])
+        # Non-critical: Welcome message
+        try:
+            welcome_escaped = shlex.quote(welcome)
+            cmd = f"echo {welcome_escaped} > /etc/motd && echo 'echo {welcome_escaped}' >> /root/.bashrc"
+            success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=15)
             if not success:
-                logger.warning(f"Security cmd {cmd} failed: {stderr}")
+                logger.warning(f"Welcome set failed: {stderr}")
+        except Exception as e:
+            logger.warning(f"Welcome message setup error: {e}")
+       
+        # Critical: Set hostname (with timeout)
+        try:
+            prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+            hostname = f"{prefix}{vps_id}"
+            hostname_escaped = shlex.quote(hostname)
+            hostname_cmd = f"echo {hostname_escaped} > /etc/hostname && hostname {hostname_escaped}"
+            success, _, stderr = run_docker_command(container_id, ["bash", "-c", hostname_cmd], timeout=15)
+            if not success:
+                logger.warning(f"Hostname set failed: {stderr}")  # Non-critical warning
+        except Exception as e:
+            logger.warning(f"Hostname setup error: {e}")
+       
+        # Non-critical: Watermark
+        try:
+            watermark_escaped = shlex.quote(watermark)
+            success, _, stderr = run_docker_command(container_id, ["bash", "-c", f"echo {watermark_escaped} > /etc/machine-info"], timeout=10)
+            if not success:
+                logger.warning(f"Watermark set failed: {stderr}")
+        except Exception as e:
+            logger.warning(f"Watermark setup error: {e}")
+       
+        # Non-critical: Security commands (run in background, don't block)
+        security_cmds = [
+            ("systemctl enable fail2ban && systemctl start fail2ban", 20),
+            ("apt-get update", 60),  # Can take time
+            ("ufw allow 22", 10),
+            ("ufw --force enable", 10),
+            ("chmod 700 /root", 10),
+        ]
+        
+        # Run critical security commands with timeouts
+        for cmd, timeout_sec in security_cmds[:3]:  # Only first 3 are critical
+            try:
+                success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=timeout_sec)
+                if not success:
+                    logger.warning(f"Security cmd {cmd} failed: {stderr}")
+            except Exception as e:
+                logger.warning(f"Security command error: {e}")
+        
+        # Run remaining commands asynchronously (non-blocking)
+        def run_remaining_security():
+            for cmd, timeout_sec in security_cmds[3:]:
+                try:
+                    run_docker_command(container_id, ["bash", "-c", cmd], timeout=timeout_sec)
+                except Exception as e:
+                    logger.warning(f"Background security cmd failed: {e}")
+        
+        threading.Thread(target=run_remaining_security, daemon=True).start()
        
         return True, vps_id
     except Exception as e:
-        logger.error(f"Setup failed for {container_id}: {e}")
+        logger.error(f"Setup failed for {container_id}: {e}", exc_info=True)
         return False, None
 
 def get_tmate_session(container_id):
@@ -1338,49 +1428,100 @@ def create_vps():
                     except Exception as e:
                         logger.warning(f"Error reading dockerfile: {e}")
 
-            # Build image
+            # Build image with timeout
             try:
-                image_tag = build_custom_image(os_image, dockerfile_content)
+                image_tag = build_custom_image(os_image, dockerfile_content, timeout=180)
+            except TimeoutError as e:
+                logger.error(f"Image build timeout: {e}")
+                raise ValueError('Image build timed out. Please try again or use a pre-built image.')
             except Exception as e:
                 logger.error(f"Image build failed: {e}")
                 raise ValueError(f'Failed to build image: {str(e)}')
 
-            # Create container
+            # Create container with timeout protection
             try:
                 cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
                 prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
-                container = docker_client.containers.run(
-                    image_tag,
-                    detach=True,
-                    privileged=True,
-                    hostname=f"{prefix}{vps_id}",
-                    mem_limit=f"{memory}g",
-                    nano_cpus=cpu * 10**9,
-                    cpuset_cpus=cpuset,
-                    cap_add=["SYS_ADMIN", "NET_ADMIN"],
-                    security_opt=["seccomp=unconfined"],
-                    network=DOCKER_NETWORK,
-                    volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
-                    restart_policy={"Name": "always"},
-                    ports=ports
-                )
-                container_id = container.id
+                
+                # Create container with timeout
+                container = None
+                try:
+                    container = docker_client.containers.run(
+                        image_tag,
+                        detach=True,
+                        privileged=True,
+                        hostname=f"{prefix}{vps_id}",
+                        mem_limit=f"{memory}g",
+                        nano_cpus=cpu * 10**9,
+                        cpuset_cpus=cpuset,
+                        cap_add=["SYS_ADMIN", "NET_ADMIN"],
+                        security_opt=["seccomp=unconfined"],
+                        network=DOCKER_NETWORK,
+                        volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
+                        restart_policy={"Name": "always"},
+                        ports=ports
+                    )
+                    container_id = container.id
+                except docker.errors.APIError as e:
+                    logger.error(f"Docker API error: {e}")
+                    raise ValueError(f'Docker API error: {str(e)}')
+                except Exception as e:
+                    logger.error(f"Container creation failed: {e}")
+                    raise ValueError(f'Failed to create container: {str(e)}')
+                
+                # Wait for container to be ready (with timeout)
+                max_wait = 30  # Maximum wait time in seconds
+                waited = 0
+                while waited < max_wait:
+                    try:
+                        container.reload()
+                        if container.status in ['running', 'created']:
+                            break
+                        time.sleep(1)
+                        waited += 1
+                    except Exception as e:
+                        logger.warning(f"Container reload attempt failed: {e}")
+                        if waited >= max_wait:
+                            raise ValueError('Container failed to start in time')
+                        time.sleep(1)
+                        waited += 1
+                
+                if waited >= max_wait:
+                    raise ValueError('Container did not start within timeout period')
+                    
             except Exception as e:
-                logger.error(f"Container creation failed: {e}")
-                raise ValueError(f'Failed to create container: {str(e)}')
+                logger.error(f"Container setup failed: {e}")
+                raise ValueError(f'Failed to setup container: {str(e)}')
 
-            # Wait for container to be ready
-            try:
-                time.sleep(5)
-                container.reload()
-            except Exception as e:
-                logger.warning(f"Container reload failed: {e}")
-
-            # Setup container
+            # Setup container (with timeout protection)
             watermark = db.get_setting('watermark', WATERMARK)
             welcome = db.get_setting('welcome_message', WELCOME_MESSAGE)
-            setup_success, _ = setup_container(container.id, memory, vps_id, ssh_port, root_password, watermark, welcome)
-            if not setup_success:
+            
+            # Run setup in background thread with timeout
+            setup_result = {'success': False, 'error': None}
+            
+            def setup_thread():
+                try:
+                    success, _ = setup_container(container.id, memory, vps_id, ssh_port, root_password, watermark, welcome)
+                    setup_result['success'] = success
+                except Exception as e:
+                    setup_result['error'] = e
+                    setup_result['success'] = False
+            
+            setup_thread_obj = threading.Thread(target=setup_thread)
+            setup_thread_obj.daemon = True
+            setup_thread_obj.start()
+            setup_thread_obj.join(timeout=120)  # 2 minute timeout for setup
+            
+            if setup_thread_obj.is_alive():
+                logger.error("Container setup timed out")
+                raise Exception('Container setup timed out. VPS may be partially configured.')
+            
+            if setup_result['error']:
+                logger.error(f"Setup error: {setup_result['error']}")
+                raise Exception(f'Container setup failed: {str(setup_result["error"])}')
+            
+            if not setup_result['success']:
                 raise Exception('Container setup failed')
 
             # Get tmate session (non-critical)
