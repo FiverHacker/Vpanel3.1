@@ -952,35 +952,97 @@ def update_vps_stats():
     except Exception as e:
         logger.error(f"VPS stats update error: {e}")
 
-def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, timeout=300):
+def get_or_pull_image(base_image=DEFAULT_OS_IMAGE, timeout=60):
     """
-    Build Docker image with timeout protection.
-    Returns image tag or raises exception.
+    Get existing image or pull from Docker Hub.
+    Returns image tag. Fast - no building required.
     """
-    with image_build_lock:
+    try:
+        # Check if image already exists locally
+        try:
+            docker_client.images.get(base_image)
+            logger.info(f"Using existing image: {base_image}")
+            return base_image
+        except docker.errors.ImageNotFound:
+            pass
+        
+        # Check database cache
         existing = db.get_image(base_image)
         if existing:
             try:
                 docker_client.images.get(existing['image_id'])
+                logger.info(f"Using cached image: {existing['image_id']}")
                 return existing['image_id']
             except docker.errors.ImageNotFound:
                 db._execute('DELETE FROM docker_images WHERE os_image = ?', (base_image,))
-       
+        
+        # Pull image from Docker Hub (fast - usually < 30 seconds)
+        logger.info(f"Pulling image: {base_image}")
+        pull_result = {'done': False, 'error': None}
+        
+        def pull_thread():
+            try:
+                docker_client.images.pull(base_image)
+                pull_result['done'] = True
+            except Exception as e:
+                pull_result['error'] = e
+        
+        pull_thread_obj = threading.Thread(target=pull_thread)
+        pull_thread_obj.daemon = True
+        pull_thread_obj.start()
+        pull_thread_obj.join(timeout=timeout)
+        
+        if pull_thread_obj.is_alive():
+            raise TimeoutError(f"Image pull timed out after {timeout} seconds")
+        
+        if pull_result['error']:
+            raise pull_result['error']
+        
+        if not pull_result['done']:
+            raise Exception("Image pull failed")
+        
+        # Cache in database
+        db.add_image({
+            'image_id': base_image,
+            'os_image': base_image,
+            'created_at': str(datetime.datetime.now())
+        })
+        
+        return base_image
+    except Exception as e:
+        logger.error(f"Image pull error: {e}")
+        raise
+
+def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, timeout=600):
+    """
+    Build custom Docker image ONLY when dockerfile_content is provided.
+    For standard images, use get_or_pull_image() instead.
+    Returns image tag or raises exception.
+    """
+    # If no custom dockerfile, just use the base image directly
+    if not dockerfile_content:
+        return get_or_pull_image(base_image, timeout=60)
+    
+    # Only build if custom dockerfile is provided
+    with image_build_lock:
+        image_tag = f"hvm/{base_image.replace(':', '-').lower()}-custom:latest"
+        
+        # Check if custom image already exists
+        try:
+            docker_client.images.get(image_tag)
+            logger.info(f"Using existing custom image: {image_tag}")
+            return image_tag
+        except docker.errors.ImageNotFound:
+            pass
+        
         temp_dir = None
         try:
-            temp_dir = f"image_cache/{base_image.replace(':', '-')}"
+            temp_dir = f"image_cache/{base_image.replace(':', '-')}-custom"
             os.makedirs(temp_dir, exist_ok=True)
            
-            if dockerfile_content:
-                with open(os.path.join(temp_dir, 'Dockerfile'), 'w') as f:
-                    f.write(dockerfile_content)
-            else:
-                dockerfile = DOCKERFILE_TEMPLATE.format(base_image=base_image)
-                with open(os.path.join(temp_dir, 'Dockerfile'), 'w') as f:
-                    f.write(dockerfile)
+            with open(os.path.join(temp_dir, 'Dockerfile'), 'w') as f:
+                f.write(dockerfile_content)
            
-            image_tag = f"hvm/{base_image.replace(':', '-').lower()}:latest"
-            
             # Build with timeout using threading
             build_result = {'image': None, 'error': None, 'logs': []}
             
@@ -990,8 +1052,7 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, tim
                         path=temp_dir, 
                         tag=image_tag, 
                         rm=True, 
-                        forcerm=True,
-                        timeout=timeout
+                        forcerm=True
                     )
                     build_result['image'] = image
                     build_result['logs'] = logs
@@ -1001,10 +1062,10 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, tim
             build_thread_obj = threading.Thread(target=build_thread)
             build_thread_obj.daemon = True
             build_thread_obj.start()
-            build_thread_obj.join(timeout=timeout + 10)  # Add buffer
+            build_thread_obj.join(timeout=timeout)
             
             if build_thread_obj.is_alive():
-                raise TimeoutError(f"Image build timed out after {timeout} seconds")
+                raise TimeoutError(f"Custom image build timed out after {timeout} seconds")
             
             if build_result['error']:
                 raise build_result['error']
@@ -1024,11 +1085,8 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None, tim
             })
            
             return image_tag
-        except subprocess.TimeoutExpired:
-            logger.error(f"Image build timeout for {base_image}")
-            raise TimeoutError(f"Image build timed out after {timeout} seconds")
         except Exception as e:
-            logger.error(f"Image build error: {e}")
+            logger.error(f"Custom image build error: {e}")
             raise
         finally:
             if temp_dir and os.path.exists(temp_dir):
@@ -1046,87 +1104,58 @@ def setup_container(container_id, memory, vps_id, ssh_port, root_password, water
         container = docker_client.containers.get(container_id)
         if container.status != "running":
             container.start()
-            # Wait for container to be ready (with timeout)
-            max_wait = 15
+            # Wait for container to be ready (with timeout) - reduced wait time
+            max_wait = 10
             waited = 0
             while waited < max_wait:
                 try:
                     container.reload()
                     if container.status == "running":
                         break
-                    time.sleep(1)
-                    waited += 1
+                    time.sleep(0.5)  # Reduced sleep time
+                    waited += 0.5
                 except Exception:
                     if waited >= max_wait:
                         raise Exception("Container failed to start")
-                    time.sleep(1)
-                    waited += 1
+                    time.sleep(0.5)
+                    waited += 0.5
         
-        # Critical: Set root password (with timeout)
+        # Critical: Set root password (with short timeout)
         whole = shlex.quote(f"root:{root_password}")
         cmd = f"echo {whole} | chpasswd"
-        success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=30)
+        success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=15)
         if not success:
             raise Exception(f"Password set failed: {stderr}")
        
-        # Non-critical: Welcome message
-        try:
-            welcome_escaped = shlex.quote(welcome)
-            cmd = f"echo {welcome_escaped} > /etc/motd && echo 'echo {welcome_escaped}' >> /root/.bashrc"
-            success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=15)
-            if not success:
-                logger.warning(f"Welcome set failed: {stderr}")
-        except Exception as e:
-            logger.warning(f"Welcome message setup error: {e}")
-       
-        # Critical: Set hostname (with timeout)
-        try:
-            prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
-            hostname = f"{prefix}{vps_id}"
-            hostname_escaped = shlex.quote(hostname)
-            hostname_cmd = f"echo {hostname_escaped} > /etc/hostname && hostname {hostname_escaped}"
-            success, _, stderr = run_docker_command(container_id, ["bash", "-c", hostname_cmd], timeout=15)
-            if not success:
-                logger.warning(f"Hostname set failed: {stderr}")  # Non-critical warning
-        except Exception as e:
-            logger.warning(f"Hostname setup error: {e}")
-       
-        # Non-critical: Watermark
-        try:
-            watermark_escaped = shlex.quote(watermark)
-            success, _, stderr = run_docker_command(container_id, ["bash", "-c", f"echo {watermark_escaped} > /etc/machine-info"], timeout=10)
-            if not success:
-                logger.warning(f"Watermark set failed: {stderr}")
-        except Exception as e:
-            logger.warning(f"Watermark setup error: {e}")
-       
-        # Non-critical: Security commands (run in background, don't block)
-        security_cmds = [
-            ("systemctl enable fail2ban && systemctl start fail2ban", 20),
-            ("apt-get update", 60),  # Can take time
-            ("ufw allow 22", 10),
-            ("ufw --force enable", 10),
-            ("chmod 700 /root", 10),
-        ]
-        
-        # Run critical security commands with timeouts
-        for cmd, timeout_sec in security_cmds[:3]:  # Only first 3 are critical
+        # Non-critical operations - run in background to speed up VPS creation
+        def setup_non_critical():
             try:
-                success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd], timeout=timeout_sec)
-                if not success:
-                    logger.warning(f"Security cmd {cmd} failed: {stderr}")
+                # Welcome message
+                welcome_escaped = shlex.quote(welcome)
+                cmd = f"echo {welcome_escaped} > /etc/motd && echo 'echo {welcome_escaped}' >> /root/.bashrc"
+                run_docker_command(container_id, ["bash", "-c", cmd], timeout=10)
             except Exception as e:
-                logger.warning(f"Security command error: {e}")
+                logger.warning(f"Welcome message setup error: {e}")
+            
+            try:
+                # Hostname
+                prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+                hostname = f"{prefix}{vps_id}"
+                hostname_escaped = shlex.quote(hostname)
+                hostname_cmd = f"echo {hostname_escaped} > /etc/hostname && hostname {hostname_escaped}"
+                run_docker_command(container_id, ["bash", "-c", hostname_cmd], timeout=10)
+            except Exception as e:
+                logger.warning(f"Hostname setup error: {e}")
+            
+            try:
+                # Watermark
+                watermark_escaped = shlex.quote(watermark)
+                run_docker_command(container_id, ["bash", "-c", f"echo {watermark_escaped} > /etc/machine-info"], timeout=10)
+            except Exception as e:
+                logger.warning(f"Watermark setup error: {e}")
         
-        # Run remaining commands asynchronously (non-blocking)
-        def run_remaining_security():
-            for cmd, timeout_sec in security_cmds[3:]:
-                try:
-                    run_docker_command(container_id, ["bash", "-c", cmd], timeout=timeout_sec)
-                except Exception as e:
-                    logger.warning(f"Background security cmd failed: {e}")
-        
-        threading.Thread(target=run_remaining_security, daemon=True).start()
+        # Run non-critical setup in background
+        threading.Thread(target=setup_non_critical, daemon=True).start()
        
         return True, vps_id
     except Exception as e:
@@ -1428,15 +1457,34 @@ def create_vps():
                     except Exception as e:
                         logger.warning(f"Error reading dockerfile: {e}")
 
-            # Build image with timeout
+            # Get or build image (uses pre-built if available)
             try:
-                image_tag = build_custom_image(os_image, dockerfile_content, timeout=180)
+                if dockerfile_content:
+                    # Only build if custom dockerfile provided
+                    image_tag = build_custom_image(os_image, dockerfile_content, timeout=600)
+                else:
+                    # Use pre-built image if available, otherwise build (with timeout)
+                    # Check if pre-built exists first
+                    existing = db.get_image(os_image)
+                    if existing:
+                        try:
+                            docker_client.images.get(existing['image_id'])
+                            image_tag = existing['image_id']
+                            logger.info(f"Using pre-built image: {image_tag}")
+                        except docker.errors.ImageNotFound:
+                            # Pre-built doesn't exist, build it now
+                            logger.info(f"Pre-built image not found, building: {os_image}")
+                            image_tag = build_custom_image(os_image, None, timeout=300)
+                    else:
+                        # Not pre-built, build it now (with shorter timeout since it's blocking)
+                        logger.info(f"Building image: {os_image}")
+                        image_tag = build_custom_image(os_image, None, timeout=300)
             except TimeoutError as e:
-                logger.error(f"Image build timeout: {e}")
-                raise ValueError('Image build timed out. Please try again or use a pre-built image.')
+                logger.error(f"Image operation timeout: {e}")
+                raise ValueError('Image build timed out. Common images are being pre-built in background. Please try again in a few minutes.')
             except Exception as e:
-                logger.error(f"Image build failed: {e}")
-                raise ValueError(f'Failed to build image: {str(e)}')
+                logger.error(f"Image operation failed: {e}")
+                raise ValueError(f'Failed to get image: {str(e)}')
 
             # Create container with timeout protection
             try:
@@ -3172,6 +3220,37 @@ def scheduled_backups():
         db.backup_data()
         logger.info("Scheduled backup performed")
 
+def prebuild_common_images():
+    """Pre-build common OS images in background to speed up VPS creation."""
+    if not docker_client:
+        return
+    
+    # Wait a bit for server to fully start
+    time.sleep(10)
+    
+    common_images = ['ubuntu:22.04', 'ubuntu:24.04', 'ubuntu:20.04', 'debian:12', 'debian:11']
+    logger.info("Starting background pre-build of common images...")
+    
+    for os_image in common_images:
+        try:
+            # Check if already built
+            existing = db.get_image(os_image)
+            if existing:
+                try:
+                    docker_client.images.get(existing['image_id'])
+                    logger.info(f"Image {os_image} already exists, skipping")
+                    continue
+                except docker.errors.ImageNotFound:
+                    pass
+            
+            # Build in background (non-blocking)
+            logger.info(f"Pre-building image: {os_image}")
+            build_custom_image(os_image, None, timeout=600)
+            logger.info(f"Successfully pre-built: {os_image}")
+        except Exception as e:
+            logger.warning(f"Failed to pre-build {os_image}: {e}")
+            # Continue with other images
+
 threading.Thread(target=system_stats_updater, daemon=True).start()
 threading.Thread(target=vps_stats_updater, daemon=True).start()
 threading.Thread(target=anti_miner_monitor, daemon=True).start()
@@ -3179,6 +3258,9 @@ threading.Thread(target=clean_stopped_containers, daemon=True).start()
 threading.Thread(target=check_expired_vps, daemon=True).start()
 threading.Thread(target=monitor_containers, daemon=True).start()
 threading.Thread(target=scheduled_backups, daemon=True).start()
+# Pre-build common images in background (non-blocking)
+if docker_client:
+    threading.Thread(target=prebuild_common_images, daemon=True).start()
 
 
 __version__ = "3.1"
