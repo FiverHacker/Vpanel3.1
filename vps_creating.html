@@ -59,6 +59,8 @@
 <script>
 const vpsId = '{{ vps_id }}';
 let progressInterval;
+let lastMessage = ''; // Track last displayed message to prevent duplicates
+let lastProgress = -1; // Track last progress value
 
 function updateProgress() {
     fetch(`/create_vps/progress/${vpsId}`)
@@ -82,13 +84,25 @@ function updateProgress() {
             progressText.textContent = data.progress + '%';
             statusText.textContent = data.message || 'Processing...';
 
-            // Add status message
-            if (data.message) {
+            // Add status message only if it's different from the last one
+            if (data.message && data.message !== lastMessage) {
+                // Remove the "Starting creation process..." placeholder if it exists
+                const placeholder = statusMessages.querySelector('div:first-child');
+                if (placeholder && placeholder.textContent === 'Starting creation process...') {
+                    placeholder.remove();
+                }
+                
                 const messageDiv = document.createElement('div');
                 messageDiv.className = 'text-sm text-gray-600';
                 messageDiv.textContent = `✓ ${data.message}`;
                 statusMessages.appendChild(messageDiv);
                 statusMessages.scrollTop = statusMessages.scrollHeight;
+                lastMessage = data.message; // Update last message
+            }
+            
+            // Also update if progress changed significantly (to show progress updates)
+            if (data.progress !== lastProgress && data.progress > lastProgress) {
+                lastProgress = data.progress;
             }
 
             // Handle completion
@@ -124,8 +138,8 @@ function updateProgress() {
         });
 }
 
-// Start polling for progress
-progressInterval = setInterval(updateProgress, 1000);
+// Start polling for progress (poll every 2 seconds to reduce load)
+progressInterval = setInterval(updateProgress, 2000);
 updateProgress(); // Initial update
 </script>
 {% endblock %}

@@ -1527,6 +1527,7 @@ def profile():
 
 @app.route('/create_vps/progress/<vps_id>')
 @login_required
+@limiter.exempt
 def get_vps_creation_progress(vps_id):
     """Get progress of VPS creation"""
     progress = vps_creation_progress.get(vps_id, {'status': 'not_found', 'progress': 0, 'message': 'Not found'})
