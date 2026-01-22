@@ -891,35 +891,59 @@ def int_to_ip(ip_int):
     return f"{ip_int // 256**3}.{(ip_int // 256**2) % 256}.{(ip_int // 256) % 256}.{ip_int % 256}"
 
 def allocate_public_ip(vps_id):
-    """Allocate a public IP from the pool for a VPS"""
+    """Allocate a unique public IP from the pool for a VPS"""
     if not TUNNEL_ENABLED:
         return None
     
     try:
-        # Get all currently used IPs
+        # Get all currently used IPs from database
         all_vps = db.get_all_vps()
         used_ips = set()
         for vps in all_vps.values():
             if vps.get('public_ip'):
                 used_ips.add(vps['public_ip'])
         
+        # Also check IPs in progress (being created)
+        for creating_vps_id, progress in vps_creation_progress.items():
+            if creating_vps_id != vps_id and progress.get('public_ip'):
+                used_ips.add(progress['public_ip'])
+        
         # Find next available IP in pool
         start_int = ip_to_int(PUBLIC_IP_POOL_START)
         end_int = ip_to_int(PUBLIC_IP_POOL_END)
         
-        for ip_int in range(start_int, end_int + 1):
-            ip = int_to_ip(ip_int)
-            if ip not in used_ips:
-                return ip
+        # Try to find available IP
+        max_attempts = min(1000, end_int - start_int + 1)
+        attempts = 0
+        current_int = start_int
         
-        logger.error("No available IPs in pool")
+        while attempts < max_attempts:
+            ip = int_to_ip(current_int)
+            if ip not in used_ips:
+                # Double-check it's really not in use
+                all_vps_check = db.get_all_vps()
+                conflict = False
+                for v in all_vps_check.values():
+                    if v.get('public_ip') == ip:
+                        conflict = True
+                        break
+                if not conflict:
+                    logger.info(f"Allocated unique public IP {ip} for VPS {vps_id}")
+                    return ip
+            
+            current_int += 1
+            if current_int > end_int:
+                current_int = start_int
+            attempts += 1
+        
+        logger.error(f"No available IPs in pool for VPS {vps_id}")
         return None
     except Exception as e:
-        logger.error(f"IP allocation error: {e}")
+        logger.error(f"IP allocation error for VPS {vps_id}: {e}")
         return None
 
 def setup_tunnel(vps_id, public_ip, container_id):
-    """Set up tunnel/routing for public IP to container"""
+    """Set up VPN-like tunnel/routing for public IP to container"""
     if not TUNNEL_ENABLED or not public_ip:
         return True
     
@@ -939,35 +963,37 @@ def setup_tunnel(vps_id, public_ip, container_id):
             logger.error(f"Could not get container IP for {container_id}")
             return False
         
-        # Set up NAT rules using iptables (requires root/sudo)
-        # Forward traffic from public IP to container IP
+        # Set up VPN-like tunnel using iptables (requires root/sudo)
+        # This creates a transparent tunnel where public IP traffic is routed to container
         if sys.platform != "win32":
             try:
-                # Add DNAT rule to forward all traffic from public IP to container IP
+                # Enable IP forwarding
+                subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=True, capture_output=True)
+                
+                # Add DNAT rule to forward all traffic from public IP to container IP (VPN-like)
                 subprocess.run([
                     'iptables', '-t', 'nat', '-A', 'PREROUTING',
                     '-d', public_ip, '-j', 'DNAT', '--to-destination', container_ip
                 ], check=True, capture_output=True)
                 
-                # Add SNAT rule for return traffic
+                # Add SNAT rule for return traffic (masquerade as public IP)
                 subprocess.run([
                     'iptables', '-t', 'nat', '-A', 'POSTROUTING',
                     '-s', container_ip, '-j', 'SNAT', '--to-source', public_ip
                 ], check=True, capture_output=True)
                 
-                # Add firewall rule to allow SSH (port 22) on public IP
-                subprocess.run([
-                    'iptables', '-A', 'INPUT',
-                    '-d', public_ip, '-p', 'tcp', '--dport', '22', '-j', 'ACCEPT'
-                ], check=True, capture_output=True)
-                
-                # Add firewall rule to allow all traffic to public IP (for other services)
+                # Allow all traffic to/from public IP (VPN tunnel behavior)
                 subprocess.run([
                     'iptables', '-A', 'INPUT',
                     '-d', public_ip, '-j', 'ACCEPT'
                 ], check=True, capture_output=True)
                 
-                # Add forwarding rule
+                subprocess.run([
+                    'iptables', '-A', 'OUTPUT',
+                    '-s', public_ip, '-j', 'ACCEPT'
+                ], check=True, capture_output=True)
+                
+                # Forward traffic between public IP and container (VPN tunnel)
                 subprocess.run([
                     'iptables', '-A', 'FORWARD',
                     '-d', container_ip, '-j', 'ACCEPT'
@@ -978,8 +1004,14 @@ def setup_tunnel(vps_id, public_ip, container_id):
                     '-s', container_ip, '-j', 'ACCEPT'
                 ], check=True, capture_output=True)
                 
-                logger.info(f"Tunnel setup complete: {public_ip} -> {container_ip} (VPS {vps_id})")
-                logger.info(f"SSH enabled on {public_ip}:22")
+                # Configure container to use public IP as source
+                # This makes the container appear to have the public IP
+                subprocess.run([
+                    'ip', 'addr', 'add', f'{public_ip}/32', 'dev', 'lo'
+                ], capture_output=True)  # May fail if already exists, that's OK
+                
+                logger.info(f"VPN tunnel setup complete: {public_ip} <-> {container_ip} (VPS {vps_id})")
+                logger.info(f"All services accessible on {public_ip} (SSH, HTTP, etc.)")
                 return True
             except subprocess.CalledProcessError as e:
                 logger.warning(f"iptables setup failed (may need root): {e}")
@@ -1038,13 +1070,18 @@ def cleanup_tunnel(vps_id, public_ip, container_id=None):
                 # Remove firewall rules for public IP
                 subprocess.run([
                     'iptables', '-D', 'INPUT',
-                    '-d', public_ip, '-p', 'tcp', '--dport', '22', '-j', 'ACCEPT'
+                    '-d', public_ip, '-j', 'ACCEPT'
                 ], capture_output=True)
                 
                 subprocess.run([
-                    'iptables', '-D', 'INPUT',
-                    '-d', public_ip, '-j', 'ACCEPT'
+                    'iptables', '-D', 'OUTPUT',
+                    '-s', public_ip, '-j', 'ACCEPT'
                 ], capture_output=True)
+                
+                # Remove IP address from loopback
+                subprocess.run([
+                    'ip', 'addr', 'del', f'{public_ip}/32', 'dev', 'lo'
+                ], capture_output=True)  # May fail if not exists, that's OK
                 
                 # Remove forwarding rules if we have container IP
                 if container_ip:
@@ -1073,6 +1110,7 @@ vps_stats_cache = {}
 console_sessions = {}
 image_build_lock = threading.Lock()
 resource_history = {vps_id: deque(maxlen=3600) for vps_id in db.get_all_vps()}
+vps_creation_progress = {}  # Track VPS creation progress
 
 def generate_token():
     return str(uuid.uuid4())
@@ -1487,6 +1525,233 @@ def profile():
    
     return render_template('profile.html', panel_name=db.get_setting('panel_name', PANEL_NAME), email=current_user.email, theme=current_user.theme)
 
+@app.route('/create_vps/progress/<vps_id>')
+@login_required
+def get_vps_creation_progress(vps_id):
+    """Get progress of VPS creation"""
+    progress = vps_creation_progress.get(vps_id, {'status': 'not_found', 'progress': 0, 'message': 'Not found'})
+    return jsonify(progress)
+
+def create_vps_async(vps_data, user_id, current_user_id):
+    """Async VPS creation function"""
+    vps_id = vps_data['vps_id']
+    container = None
+    public_ip = None
+    try:
+        vps_creation_progress[vps_id] = {'status': 'starting', 'progress': 5, 'message': 'Initializing...'}
+        
+        # Validate and prepare
+        vps_creation_progress[vps_id] = {'status': 'validating', 'progress': 10, 'message': 'Validating configuration...'}
+        
+        memory = vps_data['memory']
+        cpu = vps_data['cpu']
+        disk = vps_data['disk']
+        os_image = vps_data['os_image']
+        additional_ports = vps_data.get('additional_ports', '')
+        expires_days = vps_data.get('expires_days', 30)
+        expires_hours = vps_data.get('expires_hours', 0)
+        expires_minutes = vps_data.get('expires_minutes', 0)
+        bandwidth_limit = vps_data.get('bandwidth_limit', 0)
+        tags = vps_data.get('tags', '')
+        ssh_port = vps_data['port']
+        root_password = vps_data['root_password']
+        token = vps_data['token']
+        
+        # Build image
+        vps_creation_progress[vps_id] = {'status': 'building', 'progress': 20, 'message': 'Building Docker image...'}
+        dockerfile_content = None
+        try:
+            image_tag = build_custom_image(os_image, dockerfile_content)
+            vps_creation_progress[vps_id] = {'status': 'building', 'progress': 40, 'message': 'Image build completed'}
+        except Exception as e:
+            logger.error(f"Image build failed: {e}")
+            existing = db.get_image(os_image)
+            if existing:
+                image_tag = existing['image_id']
+            else:
+                image_tag = os_image
+        
+        # Create container
+        vps_creation_progress[vps_id] = {'status': 'creating', 'progress': 50, 'message': 'Creating container...'}
+        ports = {'22/tcp': ssh_port}
+        if additional_ports:
+            for port_str in additional_ports.split(','):
+                if port_str.strip():
+                    port_parts = port_str.strip().split(':')
+                    if len(port_parts) == 2:
+                        host, cont = port_parts
+                        try:
+                            ports[f'{cont}/tcp'] = int(host)
+                        except:
+                            pass
+        
+        cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
+        prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+        
+        # Ensure container name is unique
+        container_name = f"hvm-{vps_id}"
+        try:
+            # Check if container with this name already exists
+            existing = docker_client.containers.get(container_name)
+            if existing:
+                logger.warning(f"Container {container_name} already exists, removing...")
+                try:
+                    existing.stop()
+                    existing.remove()
+                except:
+                    pass
+        except docker.errors.NotFound:
+            pass  # Good, name is available
+        
+        container = docker_client.containers.run(
+            image_tag,
+            name=container_name,  # Set explicit name for uniqueness
+            detach=True,
+            privileged=True,
+            hostname=f"{prefix}{vps_id}",
+            mem_limit=f"{memory}g",
+            nano_cpus=cpu * 10**9,
+            cpuset_cpus=cpuset,
+            cap_add=["SYS_ADMIN", "NET_ADMIN"],
+            security_opt=["seccomp=unconfined"],
+            network=DOCKER_NETWORK,
+            volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
+            restart_policy={"Name": "always"},
+            ports=ports
+        )
+        
+        time.sleep(3)
+        container.reload()
+        vps_creation_progress[vps_id] = {'status': 'configuring', 'progress': 60, 'message': 'Configuring network...'}
+        
+        # Setup tunnel - ensure unique IP
+        public_ip = allocate_public_ip(vps_id)
+        if public_ip:
+            # Final verification - check IP is unique
+            all_vps = db.get_all_vps()
+            conflict = False
+            for v in all_vps.values():
+                if v.get('public_ip') == public_ip and v.get('vps_id') != vps_id:
+                    logger.error(f"IP conflict detected: {public_ip} already used by {v.get('vps_id')}")
+                    conflict = True
+                    break
+            
+            if conflict:
+                # Try to get a different IP
+                public_ip = allocate_public_ip(vps_id)
+                if not public_ip:
+                    logger.warning(f"Could not allocate alternative IP for VPS {vps_id}")
+                    public_ip = None
+            
+            if public_ip:
+                tunnel_success = setup_tunnel(vps_id, public_ip, container.id)
+                if tunnel_success:
+                    vps_creation_progress[vps_id] = {'status': 'configuring', 'progress': 70, 'message': f'Public IP assigned: {public_ip}'}
+                    # Store IP in progress for conflict checking
+                    vps_creation_progress[vps_id]['public_ip'] = public_ip
+                else:
+                    logger.warning(f"Tunnel setup failed for {public_ip}, continuing without tunnel")
+                    public_ip = None
+            else:
+                logger.warning(f"Could not allocate unique public IP for VPS {vps_id}")
+                public_ip = None
+        else:
+            public_ip = None
+            logger.warning(f"Could not allocate public IP for VPS {vps_id}")
+        
+        # Setup container
+        vps_creation_progress[vps_id] = {'status': 'configuring', 'progress': 75, 'message': 'Configuring VPS...'}
+        watermark = db.get_setting('watermark', WATERMARK)
+        welcome = db.get_setting('welcome_message', WELCOME_MESSAGE)
+        setup_success, _ = setup_container(container.id, memory, vps_id, ssh_port, root_password, watermark, welcome)
+        
+        if not setup_success:
+            if public_ip:
+                cleanup_tunnel(vps_id, public_ip, container.id)
+            try:
+                container.stop()
+                container.remove()
+            except Exception as e:
+                logger.error(f"Error cleaning up container {container.id}: {e}")
+            vps_creation_progress[vps_id] = {'status': 'error', 'progress': 0, 'message': 'Setup failed'}
+            return
+        
+        vps_creation_progress[vps_id] = {'status': 'finalizing', 'progress': 90, 'message': 'Getting tmate session...'}
+        
+        # Get tmate session
+        tmate_session = None
+        try:
+            time.sleep(2)  # Wait a bit for container to be fully ready
+            tmate_session = get_tmate_session(container.id)
+            if tmate_session:
+                vps_creation_progress[vps_id] = {'status': 'finalizing', 'progress': 95, 'message': 'tmate session ready'}
+            else:
+                logger.warning(f"Could not get tmate session for VPS {vps_id}")
+        except Exception as e:
+            logger.error(f"tmate session error for VPS {vps_id}: {e}")
+        
+        now = datetime.datetime.now()
+        expires_at = now + datetime.timedelta(days=expires_days, hours=expires_hours, minutes=expires_minutes)
+        
+        vps_data.update({
+            'container_id': container.id,
+            'image_id': image_tag,
+            'public_ip': public_ip,
+            'tmate_session': tmate_session,
+            'expires_at': str(expires_at),
+            'uptime_start': str(now)
+        })
+        
+        # Final check - ensure VPS ID is still unique before adding to DB
+        existing_check = db.get_all_vps()
+        if vps_id in existing_check:
+            logger.error(f"VPS ID {vps_id} already exists in database!")
+            if public_ip:
+                cleanup_tunnel(vps_id, public_ip, container.id)
+            try:
+                container.stop()
+                container.remove()
+            except Exception as e:
+                logger.error(f"Error cleaning up container: {e}")
+            vps_creation_progress[vps_id] = {'status': 'error', 'progress': 0, 'message': 'VPS ID conflict - please try again'}
+            return
+        
+        if db.add_vps(vps_data):
+            db.log_action(current_user_id, 'create_vps', f'Created VPS {vps_id}')
+            db.add_notification(user_id, f'New VPS {vps_id} created')
+            resource_history[vps_id] = deque(maxlen=3600)
+            # Clean up progress after 5 minutes
+            def cleanup_progress():
+                time.sleep(300)  # 5 minutes
+                if vps_id in vps_creation_progress:
+                    del vps_creation_progress[vps_id]
+            threading.Thread(target=cleanup_progress, daemon=True).start()
+            vps_creation_progress[vps_id] = {'status': 'completed', 'progress': 100, 'message': 'VPS created successfully!', 'vps_id': vps_id}
+        else:
+            # Cleanup on DB failure
+            if public_ip:
+                cleanup_tunnel(vps_id, public_ip, container.id)
+            try:
+                container.stop()
+                container.remove()
+            except:
+                pass
+            vps_creation_progress[vps_id] = {'status': 'error', 'progress': 0, 'message': 'Database error - VPS not saved'}
+    except Exception as e:
+        logger.error(f"Async VPS creation error for {vps_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # Try to cleanup if container was created
+        try:
+            if container:
+                if public_ip:
+                    cleanup_tunnel(vps_id, public_ip, container.id)
+                container.stop()
+                container.remove()
+        except Exception as cleanup_error:
+            logger.error(f"Cleanup error: {cleanup_error}")
+        vps_creation_progress[vps_id] = {'status': 'error', 'progress': 0, 'message': str(e)}
+
 @app.route('/create_vps', methods=['GET', 'POST'])
 @login_required
 @admin_required
@@ -1535,9 +1800,118 @@ def create_vps():
             if len(docker_client.containers.list(all=True)) >= int(db.get_setting('max_containers', MAX_CONTAINERS)):
                 raise ValueError('Max containers reached')
 
-            vps_id = generate_vps_id()
+            # Generate unique VPS ID (ensure it doesn't exist)
+            max_attempts = 100
+            vps_id = None
+            for _ in range(max_attempts):
+                candidate_id = generate_vps_id()
+                existing_vps = db.get_all_vps()
+                if candidate_id not in existing_vps:
+                    vps_id = candidate_id
+                    break
+            if not vps_id:
+                raise ValueError('Could not generate unique VPS ID')
+            
             token = generate_token()
             root_password = generate_ssh_password()
+            
+            # Prepare VPS data for async creation - get ALL used ports and IPs
+            used_ports = set()
+            used_vps_ids = set()
+            used_public_ips = set()
+            
+            # Get from database
+            for v in db.get_all_vps().values():
+                used_vps_ids.add(v['vps_id'])
+                used_ports.add(v.get('port', 0))
+                if v.get('public_ip'):
+                    used_public_ips.add(v['public_ip'])
+                for p in v.get('additional_ports', '').split(','):
+                    if p and ':' in p:
+                        try:
+                            used_ports.add(int(p.split(':')[0]))
+                        except (ValueError, IndexError):
+                            pass
+            
+            # Get from Docker containers (in case DB is out of sync)
+            try:
+                for container in docker_client.containers.list(all=True):
+                    if container.name.startswith('hvm-') or container.name.startswith(prefix):
+                        used_vps_ids.add(container.name.replace('hvm-', '').replace(prefix, ''))
+            except:
+                pass
+
+            # Generate unique SSH port
+            ssh_port = random.randint(20000, 30000)
+            attempts = 0
+            while ssh_port in used_ports and attempts < 100:
+                ssh_port = random.randint(20000, 30000)
+                attempts += 1
+            if ssh_port in used_ports:
+                raise ValueError('Could not find available SSH port')
+            
+            # Validate additional ports are unique
+            if additional_ports:
+                for port_str in additional_ports.split(','):
+                    if port_str.strip():
+                        port_parts = port_str.strip().split(':')
+                        if len(port_parts) == 2:
+                            try:
+                                host_port = int(port_parts[0])
+                                if host_port in used_ports:
+                                    raise ValueError(f"Port {host_port} is already in use")
+                                used_ports.add(host_port)  # Reserve it
+                            except ValueError as e:
+                                if 'already in use' in str(e):
+                                    raise
+                                raise ValueError(f"Invalid port format: '{port_str.strip()}'")
+            
+            now = datetime.datetime.now()
+            expires_at = now + datetime.timedelta(days=expires_days, hours=expires_hours, minutes=expires_minutes)
+            watermark = db.get_setting('watermark', WATERMARK)
+            prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+            
+            vps_data = {
+                'token': token,
+                'vps_id': vps_id,
+                'memory': memory,
+                'cpu': cpu,
+                'disk': disk,
+                'bandwidth_limit': bandwidth_limit,
+                'username': 'root',
+                'password': root_password,
+                'root_password': root_password,
+                'created_by': user_id,
+                'created_at': str(now),
+                'watermark': watermark,
+                'os_image': os_image,
+                'restart_count': 0,
+                'last_restart': None,
+                'status': 'creating',
+                'port': ssh_port,
+                'expires_at': str(expires_at),
+                'expires_days': expires_days,
+                'expires_hours': expires_hours,
+                'expires_minutes': expires_minutes,
+                'additional_ports': additional_ports,
+                'tags': tags
+            }
+            
+            # Start async creation
+            thread = threading.Thread(
+                target=create_vps_async,
+                args=(vps_data, user_id, current_user.id),
+                daemon=True
+            )
+            thread.start()
+            
+            # Return progress page immediately
+            return render_template(
+                'vps_creating.html',
+                vps_id=vps_id,
+                panel_name=db.get_setting('panel_name', PANEL_NAME),
+                theme=current_user.theme
+            )
 
             used_ports = set()
             for v in db.get_all_vps().values():
@@ -1596,23 +1970,40 @@ def create_vps():
                 except:
                     raise ValueError(f"Image build failed and no fallback available: {e}")
 
-            cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
-            prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
-            container = docker_client.containers.run(
-                image_tag,
-                detach=True,
-                privileged=True,
-                hostname=f"{prefix}{vps_id}",
-                mem_limit=f"{memory}g",
-                nano_cpus=cpu * 10**9,
-                cpuset_cpus=cpuset,
-                cap_add=["SYS_ADMIN", "NET_ADMIN"],
-                security_opt=["seccomp=unconfined"],
-                network=DOCKER_NETWORK,
-                volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
-                restart_policy={"Name": "always"},
-                ports=ports
-            )
+        cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
+        prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+        
+        # Ensure container name is unique
+        container_name = f"hvm-{vps_id}"
+        try:
+            # Check if container with this name already exists
+            existing = docker_client.containers.get(container_name)
+            if existing:
+                logger.warning(f"Container {container_name} already exists, removing...")
+                try:
+                    existing.stop()
+                    existing.remove()
+                except:
+                    pass
+        except docker.errors.NotFound:
+            pass  # Good, name is available
+        
+        container = docker_client.containers.run(
+            image_tag,
+            name=container_name,  # Set explicit name for uniqueness
+            detach=True,
+            privileged=True,
+            hostname=f"{prefix}{vps_id}",
+            mem_limit=f"{memory}g",
+            nano_cpus=cpu * 10**9,
+            cpuset_cpus=cpuset,
+            cap_add=["SYS_ADMIN", "NET_ADMIN"],
+            security_opt=["seccomp=unconfined"],
+            network=DOCKER_NETWORK,
+            volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
+            restart_policy={"Name": "always"},
+            ports=ports
+        )
 
             time.sleep(5)
             container.reload()
@@ -1650,8 +2041,14 @@ def create_vps():
                 container.remove()
                 raise Exception('Setup failed')
 
-            tmate = get_tmate_session(container.id)
-
+            # Get tmate session
+            tmate_session = None
+            try:
+                time.sleep(2)  # Wait for container to be ready
+                tmate_session = get_tmate_session(container.id)
+            except Exception as e:
+                logger.error(f"tmate session error: {e}")
+            
             now = datetime.datetime.now()
             expires_at = now + datetime.timedelta(days=expires_days, hours=expires_hours, minutes=expires_minutes)
 
@@ -1668,7 +2065,7 @@ def create_vps():
                 'root_password': root_password,
                 'created_by': user_id,
                 'created_at': str(now),
-                'tmate_session': tmate,
+                'tmate_session': tmate_session,
                 'watermark': watermark,
                 'os_image': os_image,
                 'restart_count': 0,
@@ -1806,6 +2203,14 @@ def edit_vps(vps_id):
                     new_container.remove()
                     raise Exception('Setup failed')
                
+                # Get tmate session after container is ready
+                tmate_session = None
+                try:
+                    time.sleep(2)  # Wait for container to be ready
+                    tmate_session = get_tmate_session(new_container.id)
+                except Exception as e:
+                    logger.error(f"tmate session error during upgrade: {e}")
+                
                 updates = {
                     'container_id': new_container.id,
                     'memory': new_memory,
@@ -1813,6 +2218,7 @@ def edit_vps(vps_id):
                     'disk': new_disk,
                     'bandwidth_limit': new_bandwidth,
                     'os_image': new_os,
+                    'tmate_session': tmate_session,
                     'image_id': new_image_tag,
                     'additional_ports': new_ports,
                     'tags': new_tags,
@@ -1917,9 +2323,16 @@ def restart_vps(vps_id):
             'uptime_start': str(datetime.datetime.now())
         }
         db.update_vps(token, updates)
-        tmate = get_tmate_session(container.id)
-        if tmate:
-            db.update_vps(token, {'tmate_session': tmate})
+        
+        # Update tmate session after restart
+        try:
+            time.sleep(2)  # Wait for container to be ready
+            tmate_session = get_tmate_session(vps['container_id'])
+            if tmate_session:
+                db.update_vps(token, {'tmate_session': tmate_session})
+        except Exception as e:
+            logger.error(f"tmate session update error: {e}")
+        
         db.log_action(current_user.id, 'restart_vps', f'Restarted VPS {vps_id}')
         return jsonify({'message': 'Restarted'})
     except Exception as e:
@@ -2053,7 +2466,7 @@ def clone_vps(vps_id):
             new_container.remove()
             raise Exception('Setup failed')
        
-        new_tmate = get_tmate_session(new_container.id)
+        # Don't use tmate - removed for performance
         now = datetime.datetime.now()
         new_expires = now + datetime.timedelta(days=vps['expires_days'], hours=vps['expires_hours'], minutes=vps['expires_minutes'])
        
@@ -2070,7 +2483,6 @@ def clone_vps(vps_id):
             'root_password': new_root_password,
             'created_by': current_user.id,
             'created_at': str(now),
-            'tmate_session': new_tmate,
             'watermark': watermark,
             'os_image': vps['os_image'],
             'restart_count': 0,
@@ -2087,9 +2499,20 @@ def clone_vps(vps_id):
             'tags': vps['tags']
         }
        
-        db.add_vps(new_vps_data)
-        db.log_action(current_user.id, 'clone_vps', f'Cloned VPS {vps_id} to {new_vps_id}')
-        return render_template('vps_created.html', vps=new_vps_data, server_ip=db.get_setting('server_ip', SERVER_IP), panel_name=db.get_setting('panel_name', PANEL_NAME), theme=current_user.theme)
+        if db.add_vps(new_vps_data):
+            # Get tmate session after container is ready
+            try:
+                time.sleep(2)  # Wait for container to be ready
+                tmate_session = get_tmate_session(new_container.id)
+                if tmate_session:
+                    db.update_vps(new_vps_data['token'], {'tmate_session': tmate_session})
+            except Exception as e:
+                logger.error(f"tmate session error for cloned VPS: {e}")
+            
+            db.log_action(current_user.id, 'clone_vps', f'Cloned VPS {vps_id} to {new_vps_id}')
+            db.add_notification(current_user.id, f'VPS {new_vps_id} cloned from {vps_id}')
+            resource_history[new_vps_id] = deque(maxlen=3600)
+            return render_template('vps_created.html', vps=new_vps_data, server_ip=db.get_setting('server_ip', SERVER_IP), panel_name=db.get_setting('panel_name', PANEL_NAME), theme=current_user.theme)
    
     except Exception as e:
         logger.error(f"Clone VPS error: {e}")
@@ -2310,6 +2733,14 @@ def upgrade_vps(vps_id):
             new_container.remove()
             return jsonify({'error': 'Setup failed'}), 500
        
+        # Get tmate session after container is ready
+        tmate_session = None
+        try:
+            time.sleep(2)  # Wait for container to be ready
+            tmate_session = get_tmate_session(new_container.id)
+        except Exception as e:
+            logger.error(f"tmate session error during upgrade: {e}")
+        
         db.update_vps(token, {
             'container_id': new_container.id,
             'memory': new_memory,
@@ -2317,6 +2748,7 @@ def upgrade_vps(vps_id):
             'disk': new_disk,
             'bandwidth_limit': new_bandwidth,
             'status': 'running',
+            'tmate_session': tmate_session,
             'uptime_start': str(datetime.datetime.now()) if was_running else vps['uptime_start']
         })
         db.log_action(current_user.id, 'upgrade_vps', f'Upgraded VPS {vps_id}')
@@ -3115,8 +3547,22 @@ def handle_console_connect():
 def handle_console_disconnect():
     sid = request.sid
     if sid in console_sessions:
-        os.killpg(os.getpgid(console_sessions[sid]['pid']), signal.SIGTERM)
-        del console_sessions[sid]
+        try:
+            session = console_sessions[sid]
+            if 'process' in session:
+                process = session['process']
+                if process:
+                    process.terminate()
+                    process.wait(timeout=2)
+            elif 'pid' in session:
+                try:
+                    os.killpg(os.getpgid(session['pid']), signal.SIGTERM)
+                except:
+                    pass
+        except Exception as e:
+            logger.error(f"Console disconnect error: {e}")
+        finally:
+            del console_sessions[sid]
 
 @socketio.on('start_shell', namespace='/console')
 def start_shell(data):
@@ -3129,56 +3575,74 @@ def start_shell(data):
     try:
         container = docker_client.containers.get(vps['container_id'])
         if container.status != 'running':
-            emit('error', 'Not running')
+            emit('error', 'Container not running')
             return
-    except:
+    except Exception as e:
+        logger.error(f"Console error: {e}")
         emit('error', 'Container not found')
         return
    
-    master, slave = pty.openpty()
-    fcntl.fcntl(master, fcntl.F_SETFL, fcntl.fcntl(master, fcntl.F_GETFL) | os.O_NONBLOCK)
-   
-    cmd = ['docker', 'exec', '-it', vps['container_id'], '/bin/bash']
-    pid = os.fork()
-    if pid == 0:
-        os.setsid()
-        os.dup2(slave, 0)
-        os.dup2(slave, 1)
-        os.dup2(slave, 2)
-        os.close(master)
-        os.execvp(cmd[0], cmd)
-    else:
-        os.close(slave)
-        sid = request.sid
-        console_sessions[sid] = {'fd': master, 'pid': pid}
-       
+    sid = request.sid
+    
+    # Use docker exec with subprocess for cross-platform compatibility
+    try:
+        process = subprocess.Popen(
+            ['docker', 'exec', '-i', vps['container_id'], '/bin/bash'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=0
+        )
+        
+        console_sessions[sid] = {'process': process, 'vps_id': vps_id}
+        
         def reader():
-            while True:
-                ready, _, _ = select.select([master], [], [], 1)
-                if ready:
-                    data = os.read(master, 1024)
-                    if not data:
+            try:
+                while True:
+                    if sid not in console_sessions:
                         break
-                    emit('output', data.decode('utf-8', errors='ignore'))
-            if sid in console_sessions:
-                del console_sessions[sid]
-            emit('shell_exit')
-       
+                    output = process.stdout.readline()
+                    if not output and process.poll() is not None:
+                        break
+                    if output:
+                        emit('output', output)
+            except Exception as e:
+                logger.error(f"Console reader error: {e}")
+            finally:
+                if sid in console_sessions:
+                    del console_sessions[sid]
+                emit('shell_exit')
+        
         threading.Thread(target=reader, daemon=True).start()
+    except Exception as e:
+        logger.error(f"Console start error: {e}")
+        emit('error', f'Failed to start console: {str(e)}')
 
 @socketio.on('input', namespace='/console')
 def handle_input(data):
     sid = request.sid
-    if sid in console_sessions:
-        os.write(console_sessions[sid]['fd'], data.encode('utf-8'))
+    if sid not in console_sessions:
+        emit('error', 'No active session')
+        return
+    
+    try:
+        session = console_sessions[sid]
+        process = session['process']
+        if process and process.stdin:
+            process.stdin.write(data)
+            process.stdin.flush()
+    except Exception as e:
+        logger.error(f"Console input error: {e}")
+        emit('error', 'Failed to send input')
 
 @socketio.on('resize', namespace='/console')
 def resize_handler(data):
     sid = request.sid
-    if sid in console_sessions:
-        fd = console_sessions[sid]['fd']
-        winsize = struct.pack("HHHH", data['rows'], data['cols'], 0, 0)
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+    # Resize not critical for docker exec, but we can handle it if needed
+    if sid in console_sessions and 'process' in console_sessions[sid]:
+        # Docker exec doesn't support resize easily, but we can try
+        pass
 
 @socketio.on('connect', namespace='/admin')
 def handle_admin_connect():

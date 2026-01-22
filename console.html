@@ -62,9 +62,12 @@
             <div class="mt-4 flex justify-center">
                 <button onclick="connectSSH()" id="connectBtn"
                         class="btn-primary px-6 py-2 rounded-lg flex items-center space-x-2">
-                    <i class="fas fa-plug"></i>
-                    <span>Connect to SSH</span>
+                    <i class="fas fa-terminal"></i>
+                    <span>Connect to Console</span>
                 </button>
+            </div>
+            <div class="mt-2 text-center text-sm text-gray-600">
+                <p>Connect directly to your VPS container console</p>
             </div>
         </div>
     </div>
@@ -108,12 +111,9 @@ function connectSSH() {
     const username = document.getElementById('sshUsername').value;
     const password = document.getElementById('sshPassword').value;
 
+    // Connect directly to container console (no SSH needed)
     socket.emit('start_shell', {
-        vps_id: '{{ vps.vps_id }}',
-        host: host,
-        port: parseInt(port),
-        username: username,
-        password: password
+        vps_id: '{{ vps.vps_id }}'
     });
 }
 

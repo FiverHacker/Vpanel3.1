@@ -128,6 +128,14 @@
                         <code class="text-green-800 font-bold">{{ vps.public_ip }}</code>
                     </div>
                     {% endif %}
+                    {% if vps.tmate_session %}
+                    <div class="flex justify-between items-center p-2 bg-purple-50 rounded border border-purple-200">
+                        <span class="text-purple-800 font-medium">
+                            <i class="fas fa-terminal mr-1"></i>tmate SSH:
+                        </span>
+                        <code class="text-purple-800 font-mono text-xs">{{ vps.tmate_session }}</code>
+                    </div>
+                    {% endif %}
                     <div class="flex justify-between">
                         <span class="text-gray-600">Memory:</span>
                         <span>{{ vps.memory }} GB</span>
