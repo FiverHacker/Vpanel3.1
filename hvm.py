@@ -1579,8 +1579,19 @@ def create_vps_async(vps_data, user_id, current_user_id):
         docker_used_ports = set()
         try:
             for container in docker_client.containers.list(all=True):
+                # Check port bindings from container network settings
                 if container.attrs.get('NetworkSettings') and container.attrs['NetworkSettings'].get('Ports'):
                     for port_binding in container.attrs['NetworkSettings']['Ports'].values():
+                        if port_binding:
+                            for binding in port_binding:
+                                if binding.get('HostPort'):
+                                    try:
+                                        docker_used_ports.add(int(binding['HostPort']))
+                                    except (ValueError, TypeError):
+                                        pass
+                # Also check from HostConfig.PortBindings
+                if container.attrs.get('HostConfig') and container.attrs['HostConfig'].get('PortBindings'):
+                    for port_binding in container.attrs['HostConfig']['PortBindings'].values():
                         if port_binding:
                             for binding in port_binding:
                                 if binding.get('HostPort'):
@@ -1601,12 +1612,18 @@ def create_vps_async(vps_data, user_id, current_user_id):
                 new_ssh_port = random.randint(20000, 30000)
                 attempts += 1
             if new_ssh_port in docker_used_ports:
+                vps_creation_progress[vps_id] = {
+                    'status': 'error',
+                    'progress': 0,
+                    'message': f'Could not find available SSH port. Port {ssh_port} is in use.'
+                }
                 raise ValueError(f'Could not find available SSH port. Port {ssh_port} is in use.')
             ssh_port = new_ssh_port
             ports = {'22/tcp': ssh_port}
             vps_data['port'] = ssh_port  # Update in vps_data too
         
         if additional_ports:
+            conflicting_ports = []
             for port_str in additional_ports.split(','):
                 if port_str.strip():
                     port_parts = port_str.strip().split(':')
@@ -1615,12 +1632,22 @@ def create_vps_async(vps_data, user_id, current_user_id):
                         try:
                             host_port = int(host)
                             if host_port in docker_used_ports:
-                                raise ValueError(f"Port {host_port} is already in use by another Docker container")
-                            ports[f'{cont}/tcp'] = host_port
+                                conflicting_ports.append(str(host_port))
+                            else:
+                                ports[f'{cont}/tcp'] = host_port
                         except ValueError as e:
                             if 'already in use' in str(e):
                                 raise
                             pass
+            
+            if conflicting_ports:
+                error_msg = f"Port(s) {', '.join(conflicting_ports)} are already in use by another Docker container. Please choose different ports."
+                vps_creation_progress[vps_id] = {
+                    'status': 'error',
+                    'progress': 0,
+                    'message': error_msg
+                }
+                raise ValueError(error_msg)
         
         cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
         prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
@@ -1662,29 +1689,51 @@ def create_vps_async(vps_data, user_id, current_user_id):
             if 'port is already allocated' in error_msg or 'Bind for' in error_msg or 'port is already in use' in error_msg.lower():
                 # Extract port from error message
                 import re
-                port_match = re.search(r':(\d+)', error_msg)
-                if port_match:
-                    conflict_port = port_match.group(1)
-                    vps_creation_progress[vps_id] = {
-                        'status': 'error', 
-                        'progress': 0, 
-                        'message': f'Port {conflict_port} is already allocated. Please choose a different port or wait for the port to be released.'
-                    }
-                    raise ValueError(f"Port {conflict_port} is already allocated. Please choose a different port.")
-            vps_creation_progress[vps_id] = {
-                'status': 'error', 
-                'progress': 0, 
-                'message': f'Failed to create container: {error_msg}'
-            }
-            raise ValueError(f"Failed to create container: {error_msg}")
-        except Exception as e:
-            error_msg = str(e)
-            if 'port' in error_msg.lower() and ('allocated' in error_msg.lower() or 'in use' in error_msg.lower()):
+                port_matches = re.findall(r':(\d+)', error_msg)
+                if port_matches:
+                    conflict_ports = list(set(port_matches))  # Remove duplicates
+                    if len(conflict_ports) == 1:
+                        error_message = f'Port {conflict_ports[0]} is already allocated. Please choose a different port or wait for the port to be released.'
+                    else:
+                        error_message = f'Ports {", ".join(conflict_ports)} are already allocated. Please choose different ports.'
+                    
+                    # Only update if not already set to avoid duplicate messages
+                    if vps_creation_progress.get(vps_id, {}).get('status') != 'error':
+                        vps_creation_progress[vps_id] = {
+                            'status': 'error', 
+                            'progress': 0, 
+                            'message': error_message
+                        }
+                    raise ValueError(error_message)
+            
+            # Only update if not already set
+            if vps_creation_progress.get(vps_id, {}).get('status') != 'error':
                 vps_creation_progress[vps_id] = {
                     'status': 'error', 
                     'progress': 0, 
-                    'message': f'Port conflict: {error_msg}'
+                    'message': f'Failed to create container: {error_msg}'
                 }
+            raise ValueError(f"Failed to create container: {error_msg}")
+        except ValueError as e:
+            # Re-raise ValueError (port conflicts) without modifying progress if already set
+            error_msg = str(e)
+            if 'port' in error_msg.lower() and ('allocated' in error_msg.lower() or 'in use' in error_msg.lower()):
+                if vps_creation_progress.get(vps_id, {}).get('status') != 'error':
+                    vps_creation_progress[vps_id] = {
+                        'status': 'error', 
+                        'progress': 0, 
+                        'message': error_msg
+                    }
+            raise
+        except Exception as e:
+            error_msg = str(e)
+            if 'port' in error_msg.lower() and ('allocated' in error_msg.lower() or 'in use' in error_msg.lower()):
+                if vps_creation_progress.get(vps_id, {}).get('status') != 'error':
+                    vps_creation_progress[vps_id] = {
+                        'status': 'error', 
+                        'progress': 0, 
+                        'message': f'Port conflict: {error_msg}'
+                    }
             raise
         
         time.sleep(3)

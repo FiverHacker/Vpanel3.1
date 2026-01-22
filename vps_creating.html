@@ -84,8 +84,17 @@ function updateProgress() {
             progressText.textContent = data.progress + '%';
             statusText.textContent = data.message || 'Processing...';
 
+            // Handle error first (before adding status messages)
+            if (data.status === 'error') {
+                clearInterval(progressInterval);
+                errorMessage.classList.remove('hidden');
+                document.getElementById('errorText').textContent = data.message || 'An error occurred';
+                actionButtons.classList.remove('hidden');
+                return; // Stop processing once error is shown
+            }
+
             // Add status message only if it's different from the last one
-            if (data.message && data.message !== lastMessage) {
+            if (data.message && data.message !== lastMessage && data.status !== 'error') {
                 // Remove the "Starting creation process..." placeholder if it exists
                 const placeholder = statusMessages.querySelector('div:first-child');
                 if (placeholder && placeholder.textContent === 'Starting creation process...') {
@@ -123,14 +132,6 @@ function updateProgress() {
                         window.location.href = '/dashboard';
                     }
                 }, 3000);
-            }
-
-            // Handle error
-            if (data.status === 'error') {
-                clearInterval(progressInterval);
-                errorMessage.classList.remove('hidden');
-                document.getElementById('errorText').textContent = data.message || 'An error occurred';
-                actionButtons.classList.remove('hidden');
             }
         })
         .catch(error => {
