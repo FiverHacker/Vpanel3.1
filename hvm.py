@@ -1912,65 +1912,6 @@ def create_vps():
                 panel_name=db.get_setting('panel_name', PANEL_NAME),
                 theme=current_user.theme
             )
-
-            used_ports = set()
-            for v in db.get_all_vps().values():
-                used_ports.add(v['port'])
-                for p in v.get('additional_ports', '').split(','):
-                    if p and ':' in p:
-                        try:
-                            used_ports.add(int(p.split(':')[0]))
-                        except (ValueError, IndexError):
-                            pass  # Skip invalid port formats
-
-            ssh_port = random.randint(20000, 30000)
-            while ssh_port in used_ports:
-                ssh_port = random.randint(20000, 30000)
-
-            ports = {'22/tcp': ssh_port}
-            for port_str in additional_ports.split(','):
-                if port_str.strip():
-                    port_parts = port_str.strip().split(':')
-                    if len(port_parts) != 2:
-                        raise ValueError(f"Invalid port format: '{port_str.strip()}'. Expected format: 'host_port:container_port' (e.g., '8080:80')")
-                    host, cont = port_parts
-                    try:
-                        host_p = int(host)
-                        int(cont)  # Validate container port is a number
-                    except ValueError:
-                        raise ValueError(f"Invalid port number in '{port_str.strip()}'. Ports must be integers.")
-                    if host_p in used_ports:
-                        raise ValueError(f"Port {host_p} in use")
-                    ports[f'{cont}/tcp'] = host_p
-                    used_ports.add(host_p)
-
-            dockerfile_content = None
-            if 'custom_dockerfile' in request.files:
-                file = request.files['custom_dockerfile']
-                if file and allowed_file(file.filename):
-                    dockerfile_content = file.read().decode('utf-8')
-
-            # Build image with better error handling
-            logger.info(f"Starting image build for {os_image}...")
-            try:
-                image_tag = build_custom_image(os_image, dockerfile_content)
-                logger.info(f"Image build completed: {image_tag}")
-            except Exception as e:
-                logger.error(f"Image build failed: {e}")
-                # Try to use existing image or base image as fallback
-                try:
-                    existing = db.get_image(os_image)
-                    if existing:
-                        image_tag = existing['image_id']
-                        logger.info(f"Using existing cached image: {image_tag}")
-                    else:
-                        # Use base image directly as last resort
-                        image_tag = os_image
-                        logger.warning(f"Using base image directly: {image_tag}")
-                except:
-                    raise ValueError(f"Image build failed and no fallback available: {e}")
-
-        cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
         prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
         
         # Ensure container name is unique
