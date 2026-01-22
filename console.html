@@ -73,9 +73,13 @@
     </div>
 
     <!-- Terminal Container -->
-    <div id="terminalContainer" class="flex-1 bg-black hidden">
+    <div id="terminalContainer" class="flex-1 bg-black hidden" style="position: relative;">
         <div id="terminal" class="h-full w-full p-4 font-mono text-green-400 overflow-auto" 
-             tabindex="0" contenteditable="false" style="outline: none;"></div>
+             style="outline: none; position: relative;"></div>
+        <!-- Hidden input for keyboard capture -->
+        <input type="text" id="terminalInput" 
+               style="position: absolute; top: -9999px; left: -9999px; opacity: 0; width: 1px; height: 1px;"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
     </div>
 
     <!-- Disconnected State -->
@@ -164,11 +168,14 @@ socket.on('output', (data) => {
         document.getElementById('connectionStatus').classList.remove('hidden');
         document.getElementById('connectionForm').classList.add('hidden');
         
-        // Auto-focus terminal when output is received
+        // Auto-focus input field when output is received
         if (!isConnected) {
             setTimeout(() => {
-                terminal.focus();
-            }, 100);
+                const terminalInput = document.getElementById('terminalInput');
+                if (terminalInput) {
+                    terminalInput.focus();
+                }
+            }, 200);
         }
         
         isConnected = true;
@@ -202,72 +209,81 @@ socket.on('shell_exit', () => {
     document.getElementById('connectBtn').disabled = false;
 });
 
-// Handle terminal input - focus terminal when clicking
-document.getElementById('terminalContainer').addEventListener('click', () => {
-    const terminal = document.getElementById('terminal');
-    if (terminal) {
-        terminal.focus();
+// Handle terminal input - use hidden input field for better keyboard capture
+const terminalInput = document.getElementById('terminalInput');
+const terminal = document.getElementById('terminal');
+const terminalContainer = document.getElementById('terminalContainer');
+
+// Focus the hidden input when clicking on terminal
+terminalContainer.addEventListener('click', () => {
+    if (isConnected && !terminalContainer.classList.contains('hidden')) {
+        terminalInput.focus();
     }
 });
 
-// Handle keyboard input - improved version
-let terminalInputBuffer = '';
+terminal.addEventListener('click', () => {
+    if (isConnected && !terminalContainer.classList.contains('hidden')) {
+        terminalInput.focus();
+    }
+});
 
-document.addEventListener('keydown', (e) => {
-    const terminal = document.getElementById('terminal');
-    const terminalContainer = document.getElementById('terminalContainer');
-    
-    // Only handle input if terminal is visible and connected
-    if (!isConnected || !terminal || terminalContainer.classList.contains('hidden')) {
+// Handle keyboard input through the hidden input field
+terminalInput.addEventListener('keydown', (e) => {
+    if (!isConnected || terminalContainer.classList.contains('hidden')) {
         return;
     }
     
-    // Focus terminal if clicking on container
-    if (terminalContainer.contains(e.target) && document.activeElement !== terminal) {
-        terminal.focus();
+    // Prevent default to avoid input field showing text
+    e.preventDefault();
+    e.stopPropagation();
+    
+    let keyToSend = null;
+    
+    // Handle special keys
+    if (e.key === 'Enter') {
+        keyToSend = '\r\n';
+    } else if (e.key === 'Backspace') {
+        keyToSend = '\b';
+    } else if (e.key === 'Delete') {
+        keyToSend = '\x7f';
+    } else if (e.key === 'Tab') {
+        keyToSend = '\t';
+        e.preventDefault(); // Prevent tab from moving focus
+    } else if (e.key === 'Escape') {
+        keyToSend = '\x1b';
+    } else if (e.key === 'ArrowUp') {
+        keyToSend = '\x1b[A';
+    } else if (e.key === 'ArrowDown') {
+        keyToSend = '\x1b[B';
+    } else if (e.key === 'ArrowRight') {
+        keyToSend = '\x1b[C';
+    } else if (e.key === 'ArrowLeft') {
+        keyToSend = '\x1b[D';
+    } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+        // Regular character (but not Ctrl/Cmd combinations)
+        keyToSend = e.key;
     }
     
-    // Only process if terminal is focused or we're in the container
-    if (document.activeElement === terminal || terminalContainer.contains(document.activeElement)) {
-        // Prevent default for most keys to avoid browser behavior
-        e.preventDefault();
-        
-        let keyToSend = null;
-        
-        // Handle special keys
-        if (e.key === 'Enter') {
-            keyToSend = '\r\n';
-        } else if (e.key === 'Backspace') {
-            keyToSend = '\b';
-        } else if (e.key === 'Delete') {
-            keyToSend = '\x7f';
-        } else if (e.key === 'Tab') {
-            keyToSend = '\t';
-        } else if (e.key === 'Escape') {
-            keyToSend = '\x1b';
-        } else if (e.key === 'ArrowUp') {
-            keyToSend = '\x1b[A';
-        } else if (e.key === 'ArrowDown') {
-            keyToSend = '\x1b[B';
-        } else if (e.key === 'ArrowRight') {
-            keyToSend = '\x1b[C';
-        } else if (e.key === 'ArrowLeft') {
-            keyToSend = '\x1b[D';
-        } else if (e.key.length === 1) {
-            // Regular character
-            keyToSend = e.key;
-        }
-        
-        // Send the key if we have something to send
-        if (keyToSend !== null && isConnected) {
-            socket.emit('input', keyToSend);
-        }
+    // Send the key if we have something to send
+    if (keyToSend !== null && isConnected) {
+        socket.emit('input', keyToSend);
     }
+    
+    // Clear the input field
+    terminalInput.value = '';
 });
 
-// Handle terminal clicks for focus
-document.getElementById('terminal').addEventListener('click', () => {
-    document.getElementById('terminal').focus();
+// Also handle global keydown for when input might not be focused
+document.addEventListener('keydown', (e) => {
+    // Only handle if terminal is visible and we're not in an input field
+    if (!isConnected || terminalContainer.classList.contains('hidden')) {
+        return;
+    }
+    
+    // If we're typing in the terminal area and input field is not focused, focus it
+    if (terminalContainer.contains(e.target) && document.activeElement !== terminalInput) {
+        terminalInput.focus();
+    }
 });
 
 // Handle resize events

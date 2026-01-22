@@ -1052,17 +1052,43 @@ def setup_tunnel(vps_id, public_ip, container_id):
                     'ip', 'addr', 'add', f'{public_ip}/32', 'dev', main_interface
                 ], capture_output=True, check=False)  # May fail if already exists, that's OK
                 
-                # Add DNAT rule to forward all traffic from public IP to container IP
+                # Remove any existing rules first to avoid duplicates
                 subprocess.run([
+                    'iptables', '-t', 'nat', '-D', 'PREROUTING',
+                    '-d', public_ip, '-j', 'DNAT', '--to-destination', container_ip
+                ], capture_output=True, check=False)  # Ignore errors if rule doesn't exist
+                
+                # Add DNAT rule to forward all traffic from public IP to container IP
+                result = subprocess.run([
                     'iptables', '-t', 'nat', '-A', 'PREROUTING',
                     '-d', public_ip, '-j', 'DNAT', '--to-destination', container_ip
-                ], check=True, capture_output=True)
+                ], check=True, capture_output=True, text=True)
+                
+                if result.returncode != 0:
+                    logger.error(f"Failed to add DNAT rule: {result.stderr}")
+                    raise subprocess.CalledProcessError(result.returncode, result.args, result.stderr)
+                
+                # Remove any existing SNAT rules first
+                result_snat = subprocess.run([
+                    'iptables', '-t', 'nat', '-S', 'POSTROUTING'
+                ], capture_output=True, text=True, check=True)
+                
+                for line in result_snat.stdout.split('\n'):
+                    if container_ip in line and public_ip in line and '-A' in line:
+                        # Remove this rule
+                        parts = line.split()
+                        parts[parts.index('-A')] = '-D'
+                        subprocess.run(['iptables', '-t', 'nat'] + parts, capture_output=True, check=False)
                 
                 # Add SNAT rule for return traffic (masquerade as public IP)
-                subprocess.run([
+                result = subprocess.run([
                     'iptables', '-t', 'nat', '-A', 'POSTROUTING',
                     '-s', container_ip, '-j', 'SNAT', '--to-source', public_ip
-                ], check=True, capture_output=True)
+                ], check=True, capture_output=True, text=True)
+                
+                if result.returncode != 0:
+                    logger.error(f"Failed to add SNAT rule: {result.stderr}")
+                    raise subprocess.CalledProcessError(result.returncode, result.args, result.stderr)
                 
                 # Allow all traffic to/from public IP
                 subprocess.run([
@@ -1101,10 +1127,28 @@ def setup_tunnel(vps_id, public_ip, container_id):
                 except Exception as ns_error:
                     logger.debug(f"Could not add IP to container namespace: {ns_error}")
                 
-                logger.info(f"✓ Tunnel setup complete: {public_ip} <-> {container_ip} (VPS {vps_id})")
-                logger.info(f"✓ All services accessible on {public_ip} (SSH, HTTP, etc.)")
-                logger.info(f"✓ Interface: {main_interface}")
-                return True
+                # Verify the tunnel is working
+                try:
+                    # Check if IP is actually on the interface
+                    check_result = subprocess.run(['ip', 'addr', 'show', main_interface], 
+                                                  capture_output=True, text=True, check=True)
+                    if public_ip not in check_result.stdout:
+                        logger.warning(f"IP {public_ip} not found on {main_interface} after setup")
+                    
+                    # Check if iptables rules exist
+                    nat_check = subprocess.run(['iptables', '-t', 'nat', '-L', 'PREROUTING', '-n'], 
+                                              capture_output=True, text=True, check=True)
+                    if public_ip not in nat_check.stdout:
+                        logger.warning(f"DNAT rule for {public_ip} not found in iptables")
+                    
+                    logger.info(f"✓ Tunnel setup complete: {public_ip} <-> {container_ip} (VPS {vps_id})")
+                    logger.info(f"✓ All services accessible on {public_ip} (SSH, HTTP, etc.)")
+                    logger.info(f"✓ Interface: {main_interface}")
+                    logger.info(f"✓ Test SSH: ssh root@{public_ip} -p 22")
+                    return True
+                except Exception as verify_error:
+                    logger.warning(f"Tunnel verification warning: {verify_error}")
+                    return True  # Still return True as setup commands succeeded
             except subprocess.CalledProcessError as e:
                 logger.error(f"iptables setup failed (may need root/sudo): {e}")
                 logger.error(f"Error output: {e.stderr.decode() if e.stderr else 'No error output'}")
@@ -1656,10 +1700,86 @@ def get_tmate_session(container_id):
                 logger.warning(f"Failed to install tmate in container {container_id}: {install_cmd.stderr}")
                 return None
         
-        # Now try to get tmate session using tmate -F (foreground mode)
-        # This is the standard way to get a tmate session
+        # Kill any existing tmate sessions to avoid conflicts
+        subprocess.run(
+            ["docker", "exec", container_id, "bash", "-c", "pkill -9 tmate || true"],
+            capture_output=True,
+            timeout=5
+        )
+        time.sleep(0.5)
+        
+        # Create a persistent tmate session using socket
+        # This keeps the session alive even after we disconnect
+        socket_path = "/tmp/tmate.sock"
+        
+        # Start tmate in detached mode with socket
+        start_cmd = subprocess.run(
+            ["docker", "exec", "-d", container_id, "bash", "-c",
+             f"tmate -S {socket_path} new-session -d; sleep 2"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if start_cmd.returncode != 0:
+            logger.warning(f"Failed to start tmate session: {start_cmd.stderr}")
+            # Fallback to foreground mode
+            return get_tmate_session_foreground(container_id)
+        
+        # Wait a bit for session to establish
+        time.sleep(2)
+        
+        # Get the SSH session string from the socket
+        session_cmd = subprocess.run(
+            ["docker", "exec", container_id, "bash", "-c",
+             f"tmate -S {socket_path} display -p '#{{tmate_ssh}}' 2>/dev/null || tmate -S {socket_path} wait"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        
+        session = None
+        if session_cmd.returncode == 0 and session_cmd.stdout:
+            session = session_cmd.stdout.strip()
+            # Clean up the session string
+            session = session.strip('"').strip("'").strip()
+            if session.startswith("ssh "):
+                session = session[4:].strip()
+        
+        # If socket method didn't work, try foreground method
+        if not session:
+            logger.info("Socket method failed, trying foreground method...")
+            return get_tmate_session_foreground(container_id)
+        
+        # Verify session is valid
+        if session and "@" in session and "tmate.io" in session:
+            logger.info(f"✓ Successfully got tmate session for container {container_id}: {session[:50]}...")
+            # Keep the session alive by ensuring tmate process continues running
+            subprocess.run(
+                ["docker", "exec", "-d", container_id, "bash", "-c",
+                 f"while true; do tmate -S {socket_path} has-session 2>/dev/null || tmate -S {socket_path} new-session -d; sleep 30; done"],
+                capture_output=True
+            )
+            return session
+        else:
+            logger.warning(f"Invalid tmate session format: {session}")
+            return get_tmate_session_foreground(container_id)
+            
+    except subprocess.TimeoutExpired:
+        logger.error(f"tmate session generation timed out for container {container_id}")
+        return None
+    except Exception as e:
+        logger.error(f"tmate error for container {container_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+def get_tmate_session_foreground(container_id):
+    """Fallback method: Get tmate session using foreground mode"""
+    try:
+        # Use tmate -F (foreground mode) to get session
         process = subprocess.Popen(
-            ["docker", "exec", "-i", container_id, "timeout", "15", "tmate", "-F"],
+            ["docker", "exec", "-i", container_id, "timeout", "20", "tmate", "-F"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1670,10 +1790,9 @@ def get_tmate_session(container_id):
         session = None
         output_lines = []
         
-        # Read output for up to 15 seconds
-        while time.time() - start < 15:
+        # Read output for up to 20 seconds
+        while time.time() - start < 20:
             if process.poll() is not None:
-                # Process finished, read remaining output
                 remaining = process.stdout.read()
                 if remaining:
                     output_lines.extend(remaining.split('\n'))
@@ -1685,33 +1804,25 @@ def get_tmate_session(container_id):
                     line = line.strip()
                     output_lines.append(line)
                     
-                    # Look for SSH session in various formats that tmate outputs
+                    # Look for SSH session in various formats
                     if "ssh session:" in line.lower():
-                        # Format: "ssh session: user@host.tmate.io"
                         parts = line.split("ssh session:", 1) if "ssh session:" in line else line.split("SSH session:", 1)
                         if len(parts) > 1:
-                            session = parts[1].strip()
-                            # Clean up any extra characters
-                            session = session.strip('"').strip("'").strip()
+                            session = parts[1].strip().strip('"').strip("'").strip()
                             break
                     elif "ssh " in line.lower() and "@" in line and "tmate.io" in line:
-                        # Format: "ssh user@host.tmate.io"
-                        if "ssh " in line:
-                            parts = line.split("ssh ", 1)
-                            if len(parts) > 1:
-                                session = parts[1].strip()
-                                session = session.strip('"').strip("'").strip()
-                                break
+                        parts = line.split("ssh ", 1)
+                        if len(parts) > 1:
+                            session = parts[1].strip().strip('"').strip("'").strip()
+                            break
                     elif "@" in line and "tmate.io" in line and not session:
-                        # Just the connection string: "user@host.tmate.io"
-                        session = line.strip()
-                        session = session.strip('"').strip("'").strip()
+                        session = line.strip().strip('"').strip("'").strip()
                         break
             except Exception as read_error:
                 logger.debug(f"Error reading tmate output: {read_error}")
                 break
         
-        # Clean up process if still running
+        # Clean up
         if process.poll() is None:
             process.terminate()
             try:
@@ -1720,24 +1831,17 @@ def get_tmate_session(container_id):
                 process.kill()
         
         if session:
-            # Final cleanup of session string
             session = session.strip()
-            # Remove any leading "ssh " if present
             if session.startswith("ssh "):
                 session = session[4:].strip()
-            logger.info(f"Successfully got tmate session for container {container_id}: {session[:50]}...")
-            return session
-        else:
-            logger.warning(f"Could not extract tmate session. Output: {output_lines[:10]}")
-            return None
-            
-    except subprocess.TimeoutExpired:
-        logger.error(f"tmate session generation timed out for container {container_id}")
+            if session and "@" in session and "tmate.io" in session:
+                logger.info(f"✓ Got tmate session (foreground method): {session[:50]}...")
+                return session
+        
+        logger.warning(f"Could not extract tmate session. Output: {output_lines[:10]}")
         return None
     except Exception as e:
-        logger.error(f"tmate error for container {container_id}: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Foreground tmate method error: {e}")
         return None
 
 def allowed_file(filename):
@@ -2146,8 +2250,23 @@ def create_vps_async(vps_data, user_id, current_user_id):
                     vps_creation_progress[vps_id] = {'status': 'configuring', 'progress': 70, 'message': f'Public IP assigned: {public_ip}'}
                     # Store IP in progress for conflict checking
                     vps_creation_progress[vps_id]['public_ip'] = public_ip
+                    
+                    # Verify tunnel is actually working
+                    time.sleep(1)
+                    try:
+                        # Test if IP is reachable (ping test)
+                        ping_result = subprocess.run(['ping', '-c', '1', '-W', '1', public_ip], 
+                                                    capture_output=True, timeout=3, check=False)
+                        if ping_result.returncode == 0:
+                            logger.info(f"✓ IP {public_ip} is reachable")
+                        else:
+                            logger.warning(f"⚠ IP {public_ip} may not be reachable yet (tunnel may need a moment)")
+                    except Exception as ping_error:
+                        logger.debug(f"Ping test skipped: {ping_error}")
                 else:
-                    logger.warning(f"Tunnel setup failed for {public_ip}, continuing without tunnel")
+                    logger.error(f"✗ Tunnel setup FAILED for {public_ip}")
+                    logger.error(f"  This means SSH to {public_ip} will NOT work")
+                    logger.error(f"  Please check: 1) Root/sudo access, 2) iptables installed, 3) Network interface")
                     public_ip = None
             else:
                 logger.warning(f"Could not allocate unique public IP for VPS {vps_id}")
