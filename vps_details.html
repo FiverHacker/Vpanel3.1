@@ -10,9 +10,14 @@
             <div>
                 <h1 class="text-2xl font-bold">{{ vps.vps_id }}</h1>
                 <div class="flex flex-wrap items-center gap-2 mt-2">
-                    <span class="status-{{ vps.status }} px-3 py-1 rounded-full text-sm font-medium">
+                    <span class="status-{% if container_status == 'running' %}running{% elif container_status == 'exited' or container_status == 'stopped' %}stopped{% elif container_status == 'not_found' %}not_found{% else %}{{ vps.status }}{% endif %} px-3 py-1 rounded-full text-sm font-medium">
                         <i class="fas fa-circle mr-1"></i>
-                        {{ vps.status|title }}
+                        {% if container_status == 'running' %}Running
+                        {% elif container_status == 'exited' or container_status == 'stopped' %}Stopped
+                        {% elif container_status == 'not_found' %}Not Found
+                        {% elif container_status == 'paused' %}Paused
+                        {% elif vps.status == 'creating' %}Creating
+                        {% else %}{{ vps.status|title }}{% endif %}
                     </span>
                     <span class="bg-gray-100 px-2 py-1 rounded text-sm">
                         <i class="fas fa-microchip mr-1"></i>{{ vps.cpu }} CPU
@@ -26,7 +31,7 @@
                 </div>
             </div>
             <div class="flex flex-wrap gap-2">
-                {% if vps.status == 'running' %}
+                {% if vps.status == 'running' or container_status == 'running' %}
                 <button onclick="stopVPS('{{ vps.vps_id }}')" 
                         class="bg-red-500 text-white px-4 py-2 rounded-lg hover:bg-red-600 transition flex items-center">
                     <i class="fas fa-stop mr-1"></i>Stop
@@ -34,6 +39,11 @@
                 <button onclick="restartVPS('{{ vps.vps_id }}')" 
                         class="bg-yellow-500 text-white px-4 py-2 rounded-lg hover:bg-yellow-600 transition flex items-center">
                     <i class="fas fa-redo mr-1"></i>Restart
+                </button>
+                {% elif vps.status == 'creating' %}
+                <button disabled
+                        class="bg-gray-400 text-white px-4 py-2 rounded-lg cursor-not-allowed flex items-center">
+                    <i class="fas fa-spinner fa-spin mr-1"></i>Creating...
                 </button>
                 {% else %}
                 <button onclick="startVPS('{{ vps.vps_id }}')" 

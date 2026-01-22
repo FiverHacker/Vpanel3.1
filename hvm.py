@@ -1293,6 +1293,25 @@ def setup_container(container_id, memory, vps_id, ssh_port, root_password, water
         if container.status != "running":
             container.start()
             time.sleep(5)
+        
+        # Get CPU count from container config
+        container.reload()
+        cpu_count = 1
+        if container.attrs.get('HostConfig', {}).get('CpuQuota'):
+            cpu_quota = container.attrs['HostConfig']['CpuQuota']
+            cpu_period = container.attrs['HostConfig'].get('CpuPeriod', 100000)
+            if cpu_period > 0:
+                cpu_count = max(1, int(cpu_quota / cpu_period))
+        elif container.attrs.get('HostConfig', {}).get('NanoCpus'):
+            cpu_count = max(1, int(container.attrs['HostConfig']['NanoCpus'] / 10**9))
+        elif container.attrs.get('HostConfig', {}).get('CpuCount'):
+            cpu_count = container.attrs['HostConfig']['CpuCount']
+        
+        # Get memory limit from container
+        memory_bytes = container.attrs.get('HostConfig', {}).get('Memory', 0)
+        if memory_bytes == 0:
+            memory_bytes = memory * 1024 * 1024 * 1024  # Convert GB to bytes
+        memory_mb = memory_bytes // (1024 * 1024)
        
         whole = shlex.quote(f"root:{root_password}")
         cmd = f"echo {whole} | chpasswd"
@@ -1332,6 +1351,147 @@ def setup_container(container_id, memory, vps_id, ssh_port, root_password, water
             logger.warning(f"SSH config update failed: {stderr}")
         else:
             logger.info(f"SSH configured to listen on 0.0.0.0:22 for container {container_id}")
+        
+        # Configure CPU and Memory limits to be visible inside container
+        # Use bind mounts to override /proc/cpuinfo and /proc/meminfo
+        memory_kb = memory_mb * 1024
+        
+        # Get a sample of original cpuinfo to extract CPU info format
+        orig_cpuinfo_cmd = "cat /proc/cpuinfo | grep -A 15 '^processor	: 0' | head -n 20"
+        success_orig, orig_cpuinfo, _ = run_docker_command(container_id, ["bash", "-c", orig_cpuinfo_cmd])
+        
+        # Create fake cpuinfo with only allocated CPUs
+        fake_cpuinfo_lines = []
+        for i in range(cpu_count):
+            fake_cpuinfo_lines.append(f"processor	: {i}")
+        
+        # Add CPU details from original (if available)
+        if success_orig and orig_cpuinfo:
+            # Extract non-processor lines from original
+            for line in orig_cpuinfo.split('\n'):
+                if line.strip() and not line.strip().startswith('processor'):
+                    if 'model name' in line.lower():
+                        fake_cpuinfo_lines.append(f"model name	: Virtual CPU ({cpu_count} cores)")
+                    elif 'cpu cores' in line.lower():
+                        fake_cpuinfo_lines.append(f"cpu cores	: {cpu_count}")
+                    elif 'siblings' in line.lower():
+                        fake_cpuinfo_lines.append(f"siblings	: {cpu_count}")
+                    elif not any(x in line.lower() for x in ['processor', 'physical id', 'core id']):
+                        fake_cpuinfo_lines.append(line)
+        else:
+            # Fallback if we can't read original
+            fake_cpuinfo_lines.extend([
+                "vendor_id	: GenuineIntel",
+                "model name	: Virtual CPU",
+                f"cpu cores	: {cpu_count}",
+                f"siblings	: {cpu_count}",
+                "cpu MHz	: 2800.000",
+                "cache size	: 4096 KB"
+            ])
+        
+        fake_cpuinfo_content = '\n'.join(fake_cpuinfo_lines)
+        
+        # Create fake meminfo
+        fake_meminfo_content = f"""MemTotal:       {memory_kb}000 kB
+MemFree:        {memory_kb}000 kB
+MemAvailable:   {memory_kb}000 kB
+Buffers:        0 kB
+Cached:         0 kB
+SwapCached:     0 kB
+Active:         0 kB
+Inactive:       0 kB
+Active(anon):   0 kB
+Inactive(anon): 0 kB
+Active(file):   0 kB
+Inactive(file): 0 kB
+Unevictable:    0 kB
+Mlocked:        0 kB
+SwapTotal:      0 kB
+SwapFree:       0 kB
+Dirty:          0 kB
+Writeback:      0 kB
+AnonPages:      0 kB
+Mapped:          0 kB
+Shmem:          0 kB
+Slab:           0 kB
+SReclaimable:   0 kB
+SUnreclaim:     0 kB
+KernelStack:    0 kB
+PageTables:     0 kB
+NFS_Unstable:   0 kB
+Bounce:         0 kB
+WritebackTmp:   0 kB
+CommitLimit:    {memory_kb}000 kB
+Committed_AS:   0 kB
+VmallocTotal:   34359738367 kB
+VmallocUsed:    0 kB
+VmallocChunk:   0 kB
+HardwareCorrupted: 0 kB
+AnonHugePages:  0 kB
+ShmemHugePages: 0 kB
+ShmemPmdMapped: 0 kB
+CmaTotal:       0 kB
+CmaFree:        0 kB
+HugePages_Total: 0
+HugePages_Free: 0
+HugePages_Rsvd: 0
+HugePages_Surp: 0
+Hugepagesize:   2048 kB
+DirectMap4k:    0 kB
+DirectMap2M:    0 kB
+DirectMap1G:    0 kB
+"""
+        
+        # Create and mount fake proc files
+        resource_config_cmd = f"""
+# Create directory for fake proc files
+mkdir -p /tmp/fake_proc
+
+# Write fake cpuinfo
+cat > /tmp/fake_proc/cpuinfo << 'EOFCPU'
+{fake_cpuinfo_content}
+EOFCPU
+
+# Write fake meminfo
+cat > /tmp/fake_proc/meminfo << 'EOFMEM'
+{fake_meminfo_content}
+EOFMEM
+
+# Bind mount over /proc files (works in privileged containers)
+mount --bind /tmp/fake_proc/cpuinfo /proc/cpuinfo 2>/dev/null && echo "CPU info overridden" || echo "CPU override failed"
+mount --bind /tmp/fake_proc/meminfo /proc/meminfo 2>/dev/null && echo "Memory info overridden" || echo "Memory override failed"
+
+# Create systemd service to remount on boot
+cat > /etc/systemd/system/fake-resources.service << 'EOFSVC'
+[Unit]
+Description=Override CPU and Memory Info
+After=basic.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'mount --bind /tmp/fake_proc/cpuinfo /proc/cpuinfo 2>/dev/null || true; mount --bind /tmp/fake_proc/meminfo /proc/meminfo 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOFSVC
+
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable fake-resources.service 2>/dev/null || true
+
+echo "Resource limits configured: {cpu_count} CPUs, {memory_mb}MB RAM"
+"""
+        
+        # Apply CPU and memory configuration
+        success, _, stderr = run_docker_command(container_id, ["bash", "-c", resource_config_cmd.format(
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            memory_kb=memory_kb
+        )])
+        if not success:
+            logger.warning(f"CPU/Memory limit configuration failed: {stderr}")
+        else:
+            logger.info(f"Configured container to show {cpu_count} CPUs and {memory_mb}MB RAM")
         
         security_cmds = [
             "systemctl enable fail2ban && systemctl start fail2ban",
@@ -1672,6 +1832,12 @@ def create_vps_async(vps_data, user_id, current_user_id):
         except docker.errors.NotFound:
             pass  # Good, name is available
         
+        # Calculate CPU quota and period for proper CPU limiting
+        # CPU quota = (desired_cpus / total_cpus) * period
+        # Using period of 100000 (100ms) for better granularity
+        cpu_period = 100000
+        cpu_quota = int(cpu * cpu_period)
+        
         try:
             container = docker_client.containers.run(
                 image_tag,
@@ -1679,8 +1845,10 @@ def create_vps_async(vps_data, user_id, current_user_id):
                 detach=True,
                 privileged=True,
                 hostname=f"{prefix}{vps_id}",
-                mem_limit=f"{memory}g",
-                nano_cpus=cpu * 10**9,
+                mem_limit=f"{memory}g",  # Memory limit in GB
+                memswap_limit=f"{memory}g",  # Disable swap to enforce strict memory limit
+                cpu_quota=cpu_quota,
+                cpu_period=cpu_period,
                 cpuset_cpus=cpuset,
                 cap_add=["SYS_ADMIN", "NET_ADMIN"],
                 security_opt=["seccomp=unconfined"],
@@ -2117,13 +2285,17 @@ def edit_vps(vps_id):
                
                 cpuset = f"0-{new_cpu-1}" if new_cpu > 1 else "0"
                 prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+                cpu_period = 100000
+                cpu_quota = int(new_cpu * cpu_period)
                 new_container = docker_client.containers.run(
                     new_image_tag,
                     detach=True,
                     privileged=True,
                     hostname=f"{prefix}{vps_id}",
                     mem_limit=f"{new_memory}g",
-                    nano_cpus=new_cpu * 10**9,
+                    memswap_limit=f"{new_memory}g",
+                    cpu_quota=cpu_quota,
+                    cpu_period=cpu_period,
                     cpuset_cpus=cpuset,
                     cap_add=["SYS_ADMIN", "NET_ADMIN"],
                     security_opt=["seccomp=unconfined"],
@@ -2199,15 +2371,33 @@ def vps_details(vps_id):
     if not vps or (vps['created_by'] != current_user.id and not is_admin(current_user)):
         return render_template('error.html', error='Access denied', panel_name=db.get_setting('panel_name', PANEL_NAME), theme=current_user.theme)
    
+    # Get actual container status from Docker and sync with database
+    actual_status = 'stopped'
     try:
         container = docker_client.containers.get(vps['container_id'])
-        status = container.status
-    except:
-        status = 'not_found'
+        actual_status = container.status
+        # Sync database status with actual container status
+        if actual_status == 'running' and vps.get('status') != 'running':
+            db.update_vps(token, {'status': 'running'})
+            vps['status'] = 'running'
+        elif actual_status in ['exited', 'stopped', 'dead'] and vps.get('status') == 'running':
+            db.update_vps(token, {'status': 'stopped'})
+            vps['status'] = 'stopped'
+        elif actual_status == 'paused' and vps.get('status') != 'paused':
+            db.update_vps(token, {'status': 'paused'})
+            vps['status'] = 'paused'
+    except docker.errors.NotFound:
+        actual_status = 'not_found'
+        if vps.get('status') != 'not_found':
+            db.update_vps(token, {'status': 'not_found'})
+            vps['status'] = 'not_found'
+    except Exception as e:
+        logger.error(f"Error checking container status: {e}")
+        actual_status = vps.get('status', 'unknown')
    
     history = db.get_resource_history(vps_id, 360)
     groups = db.get_vps_groups(vps_id)
-    return render_template('vps_details.html', vps=vps, container_status=status, server_ip=db.get_setting('server_ip', SERVER_IP), panel_name=db.get_setting('panel_name', PANEL_NAME), history=history, groups=groups, theme=current_user.theme)
+    return render_template('vps_details.html', vps=vps, container_status=actual_status, server_ip=db.get_setting('server_ip', SERVER_IP), panel_name=db.get_setting('panel_name', PANEL_NAME), history=history, groups=groups, theme=current_user.theme)
 
 @app.route('/vps/<vps_id>/start')
 @login_required
@@ -2218,12 +2408,18 @@ def start_vps(vps_id):
    
     try:
         container = docker_client.containers.get(vps['container_id'])
-        if container.status == 'running':
-            return jsonify({'error': 'Already running'}), 400
+        actual_status = container.status
+        if actual_status == 'running':
+            # Container is already running, sync database
+            db.update_vps(token, {'status': 'running', 'uptime_start': str(datetime.datetime.now())})
+            return jsonify({'message': 'Already running', 'status': 'running'})
+        
         container.start()
         db.update_vps(token, {'status': 'running', 'uptime_start': str(datetime.datetime.now())})
         db.log_action(current_user.id, 'start_vps', f'Started VPS {vps_id}')
-        return jsonify({'message': 'Started'})
+        return jsonify({'message': 'Started', 'status': 'running'})
+    except docker.errors.NotFound:
+        return jsonify({'error': 'Container not found'}), 404
     except Exception as e:
         logger.error(f"Start VPS error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -2237,12 +2433,18 @@ def stop_vps(vps_id):
    
     try:
         container = docker_client.containers.get(vps['container_id'])
-        if container.status != 'running':
-            return jsonify({'error': 'Already stopped'}), 400
+        actual_status = container.status
+        if actual_status != 'running':
+            # Container is already stopped, sync database
+            db.update_vps(token, {'status': 'stopped'})
+            return jsonify({'message': 'Already stopped', 'status': 'stopped'})
+        
         container.stop()
         db.update_vps(token, {'status': 'stopped'})
         db.log_action(current_user.id, 'stop_vps', f'Stopped VPS {vps_id}')
-        return jsonify({'message': 'Stopped'})
+        return jsonify({'message': 'Stopped', 'status': 'stopped'})
+    except docker.errors.NotFound:
+        return jsonify({'error': 'Container not found'}), 404
     except Exception as e:
         logger.error(f"Stop VPS error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -2380,13 +2582,17 @@ def clone_vps(vps_id):
        
         cpuset = f"0-{vps['cpu']-1}" if vps['cpu'] > 1 else "0"
         prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+        cpu_period = 100000
+        cpu_quota = int(vps['cpu'] * cpu_period)
         new_container = docker_client.containers.run(
             new_image.id,
             detach=True,
             privileged=True,
             hostname=f"{prefix}{new_vps_id}",
             mem_limit=f"{vps['memory']}g",
-            nano_cpus=vps['cpu'] * 10**9,
+            memswap_limit=f"{vps['memory']}g",
+            cpu_quota=cpu_quota,
+            cpu_period=cpu_period,
             cpuset_cpus=cpuset,
             cap_add=["SYS_ADMIN", "NET_ADMIN"],
             security_opt=["seccomp=unconfined"],
@@ -2672,13 +2878,17 @@ def upgrade_vps(vps_id):
        
         cpuset = f"0-{new_cpu-1}" if new_cpu > 1 else "0"
         prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+        cpu_period = 100000
+        cpu_quota = int(new_cpu * cpu_period)
         new_container = docker_client.containers.run(
             vps['image_id'],
             detach=True,
             privileged=True,
             hostname=f"{prefix}{vps_id}",
             mem_limit=f"{new_memory}g",
-            nano_cpus=new_cpu * 10**9,
+            memswap_limit=f"{new_memory}g",
+            cpu_quota=cpu_quota,
+            cpu_period=cpu_period,
             cpuset_cpus=cpuset,
             cap_add=["SYS_ADMIN", "NET_ADMIN"],
             security_opt=["seccomp=unconfined"],
@@ -2831,13 +3041,17 @@ def add_vps_port(vps_id):
        
         cpuset = f"0-{vps['cpu']-1}" if vps['cpu'] > 1 else "0"
         prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+        cpu_period = 100000
+        cpu_quota = int(vps['cpu'] * cpu_period)
         new_container = docker_client.containers.run(
             vps['image_id'],
             detach=True,
             privileged=True,
             hostname=f"{prefix}{vps_id}",
             mem_limit=f"{vps['memory']}g",
-            nano_cpus=vps['cpu'] * 10**9,
+            memswap_limit=f"{vps['memory']}g",
+            cpu_quota=cpu_quota,
+            cpu_period=cpu_period,
             cpuset_cpus=cpuset,
             cap_add=["SYS_ADMIN", "NET_ADMIN"],
             security_opt=["seccomp=unconfined"],
@@ -2903,13 +3117,17 @@ def remove_vps_port(vps_id):
        
         cpuset = f"0-{vps['cpu']-1}" if vps['cpu'] > 1 else "0"
         prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
+        cpu_period = 100000
+        cpu_quota = int(vps['cpu'] * cpu_period)
         new_container = docker_client.containers.run(
             vps['image_id'],
             detach=True,
             privileged=True,
             hostname=f"{prefix}{vps_id}",
             mem_limit=f"{vps['memory']}g",
-            nano_cpus=vps['cpu'] * 10**9,
+            memswap_limit=f"{vps['memory']}g",
+            cpu_quota=cpu_quota,
+            cpu_period=cpu_period,
             cpuset_cpus=cpuset,
             cap_add=["SYS_ADMIN", "NET_ADMIN"],
             security_opt=["seccomp=unconfined"],
@@ -3512,14 +3730,21 @@ def handle_console_connect():
 @socketio.on('disconnect', namespace='/console')
 def handle_console_disconnect():
     sid = request.sid
+    logger.info(f"Console client disconnected: {sid}")
     if sid in console_sessions:
         try:
             session = console_sessions[sid]
             if 'process' in session:
                 process = session['process']
                 if process:
-                    process.terminate()
-                    process.wait(timeout=2)
+                    try:
+                        process.terminate()
+                        process.wait(timeout=2)
+                    except:
+                        try:
+                            process.kill()
+                        except:
+                            pass
             elif 'pid' in session:
                 try:
                     os.killpg(os.getpgid(session['pid']), signal.SIGTERM)
@@ -3528,7 +3753,8 @@ def handle_console_disconnect():
         except Exception as e:
             logger.error(f"Console disconnect error: {e}")
         finally:
-            del console_sessions[sid]
+            if sid in console_sessions:
+                del console_sessions[sid]
 
 @socketio.on('start_shell', namespace='/console')
 def start_shell(data):
@@ -3582,31 +3808,44 @@ def start_shell(data):
             emit('error', 'No suitable shell found in container. Container may not be properly initialized.')
             return
         
-        console_sessions[sid] = {'process': process, 'vps_id': vps_id}
+        # Store session BEFORE starting reader thread
+        console_sessions[sid] = {'process': process, 'vps_id': vps_id, 'connected': True}
+        logger.info(f"Console session started for VPS {vps_id}, session ID: {sid}")
         
         # Send initial connection message
         emit('output', '\r\n\x1b[32m✓ Connected to container console...\x1b[0m\r\n')
         
         def reader():
             try:
+                import select
+                import sys
+                # Use non-blocking read if available
                 while True:
                     if sid not in console_sessions:
+                        logger.warning(f"Session {sid} removed, stopping reader")
                         break
+                    
                     if process.poll() is not None:
+                        logger.info(f"Process exited with code {process.poll()}")
                         break
+                    
                     try:
-                        # Read character by character for better responsiveness
+                        # Read with timeout to avoid blocking
                         char = process.stdout.read(1)
                         if char:
                             emit('output', char)
                         elif process.poll() is not None:
                             break
+                        else:
+                            # Small delay to prevent CPU spinning
+                            time.sleep(0.01)
                     except Exception as read_error:
                         logger.error(f"Read error: {read_error}")
                         break
             except Exception as e:
                 logger.error(f"Console reader error: {e}")
             finally:
+                logger.info(f"Console reader thread ending for session {sid}")
                 if sid in console_sessions:
                     try:
                         process.terminate()
@@ -3619,7 +3858,16 @@ def start_shell(data):
                     del console_sessions[sid]
                 emit('shell_exit')
         
-        threading.Thread(target=reader, daemon=True).start()
+        # Start reader thread
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        reader_thread.start()
+        
+        # Verify session is stored
+        if sid not in console_sessions:
+            logger.error(f"Session {sid} was not stored properly!")
+            emit('error', 'Failed to establish console session')
+        else:
+            logger.info(f"Console session established successfully for {sid}")
     except Exception as e:
         logger.error(f"Console start error: {e}")
         import traceback
@@ -3629,19 +3877,49 @@ def start_shell(data):
 @socketio.on('input', namespace='/console')
 def handle_input(data):
     sid = request.sid
+    
     if sid not in console_sessions:
-        emit('error', 'No active session')
+        logger.warning(f"Input received but no session found for {sid}")
+        logger.warning(f"Active sessions: {list(console_sessions.keys())}")
+        emit('error', 'No active session. Please reconnect.')
         return
     
     try:
         session = console_sessions[sid]
+        if 'process' not in session:
+            logger.error(f"Session {sid} exists but has no process")
+            emit('error', 'Session invalid. Please reconnect.')
+            return
+            
         process = session['process']
+        
+        if process.poll() is not None:
+            logger.warning(f"Process for session {sid} has exited")
+            emit('error', 'Console process has ended. Please reconnect.')
+            if sid in console_sessions:
+                del console_sessions[sid]
+            return
+        
         if process and process.stdin:
-            process.stdin.write(data)
-            process.stdin.flush()
+            try:
+                process.stdin.write(data)
+                process.stdin.flush()
+            except BrokenPipeError:
+                logger.error(f"Broken pipe for session {sid}")
+                emit('error', 'Connection lost. Please reconnect.')
+                if sid in console_sessions:
+                    del console_sessions[sid]
+            except Exception as write_error:
+                logger.error(f"Error writing to stdin: {write_error}")
+                emit('error', 'Failed to send input')
+        else:
+            logger.error(f"Process or stdin is None for session {sid}")
+            emit('error', 'Console process not available')
     except Exception as e:
         logger.error(f"Console input error: {e}")
-        emit('error', 'Failed to send input')
+        import traceback
+        logger.error(traceback.format_exc())
+        emit('error', f'Failed to send input: {str(e)}')
 
 @socketio.on('resize', namespace='/console')
 def resize_handler(data):

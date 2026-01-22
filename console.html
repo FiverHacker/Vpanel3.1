@@ -143,26 +143,44 @@ function toggleFullscreen() {
 // Socket event handlers
 socket.on('connect', () => {
     console.log('Connected to WebSocket');
+    isConnected = false; // Reset connection state
+});
+
+socket.on('connected', (data) => {
+    console.log('Console server connected:', data);
 });
 
 socket.on('output', (data) => {
     const terminal = document.getElementById('terminal');
-    terminal.innerHTML += data;
-    terminal.scrollTop = terminal.scrollHeight;
-    
-    // Show terminal and hide disconnected state
-    document.getElementById('terminalContainer').classList.remove('hidden');
-    document.getElementById('disconnectedState').classList.add('hidden');
-    document.getElementById('connectionStatus').classList.remove('hidden');
-    document.getElementById('connectionForm').classList.add('hidden');
-    
-    isConnected = true;
+    if (terminal) {
+        terminal.innerHTML += data;
+        terminal.scrollTop = terminal.scrollHeight;
+        
+        // Show terminal and hide disconnected state
+        document.getElementById('terminalContainer').classList.remove('hidden');
+        document.getElementById('disconnectedState').classList.add('hidden');
+        document.getElementById('connectionStatus').classList.remove('hidden');
+        document.getElementById('connectionForm').classList.add('hidden');
+        
+        isConnected = true;
+    }
 });
 
 socket.on('error', (error) => {
-    alert('Connection error: ' + error);
-    document.getElementById('connectBtn').innerHTML = '<i class="fas fa-plug"></i><span>Connect to SSH</span>';
-    document.getElementById('connectBtn').disabled = false;
+    console.error('Console error:', error);
+    const btn = document.getElementById('connectBtn');
+    if (btn) {
+        btn.innerHTML = '<i class="fas fa-terminal"></i><span>Connect to Console</span>';
+        btn.disabled = false;
+    }
+    
+    // Show error but don't use alert for every error
+    const terminal = document.getElementById('terminal');
+    if (terminal && !isConnected) {
+        terminal.innerHTML += '\r\n\x1b[31mError: ' + error + '\x1b[0m\r\n';
+    } else if (!isConnected) {
+        alert('Connection error: ' + error);
+    }
 });
 
 socket.on('shell_exit', () => {
@@ -175,12 +193,31 @@ socket.on('shell_exit', () => {
     document.getElementById('connectBtn').disabled = false;
 });
 
-// Handle terminal input
+// Handle terminal input - focus terminal when clicking
+document.getElementById('terminalContainer').addEventListener('click', () => {
+    const terminal = document.getElementById('terminal');
+    if (terminal) {
+        terminal.focus();
+    }
+});
+
+// Handle keyboard input
 document.addEventListener('keydown', (e) => {
-    if (!isConnected) return;
+    const terminal = document.getElementById('terminal');
+    const terminalContainer = document.getElementById('terminalContainer');
     
-    if (e.target.id !== 'terminal') {
+    // Only handle input if terminal is visible and connected
+    if (!isConnected || !terminal || terminalContainer.classList.contains('hidden')) {
+        return;
+    }
+    
+    // If terminal is focused or we're typing anywhere in the terminal container
+    if (document.activeElement === terminal || terminalContainer.contains(document.activeElement)) {
         socket.emit('input', e.key);
+        // Don't prevent default for special keys like Tab, but allow normal typing
+        if (e.key.length === 1 || ['Enter', 'Backspace', 'Delete'].includes(e.key)) {
+            // Let the terminal handle it naturally through socket
+        }
     }
 });
 
