@@ -177,22 +177,47 @@ MINER_PATTERNS = [
 DOCKERFILE_TEMPLATE = """
 FROM {base_image}
 ENV DEBIAN_FRONTEND=noninteractive
+
+# Install essential system packages first (required for VPS to work)
 RUN apt-get update && \\
-    apt-get install -y systemd systemd-sysv dbus sudo \\
+    apt-get install -y --no-install-recommends systemd systemd-sysv dbus sudo \\
                        curl gnupg2 apt-transport-https ca-certificates \\
-                       software-properties-common \\
-                       docker.io openssh-server tmate && \\
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-RUN mkdir /var/run/sshd && \\
+                       software-properties-common openssh-server tmate && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/* || true
+
+# Configure SSH
+RUN mkdir -p /var/run/sshd && \\
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \\
-    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-RUN systemctl enable ssh && \\
-    systemctl enable docker
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+
+# Enable services
+RUN systemctl enable ssh || systemctl enable sshd || true
+
+# Install essential tools (fast, commonly available)
 RUN apt-get update && \\
-    apt-get install -y neofetch htop nano vim wget git tmux net-tools dnsutils iputils-ping ufw \\
-                       fail2ban nmap iotop btop wireguard openvpn zabbix-agent glances iftop tcpdump samba apache2 prometheus clamav sysbench && \\
-    apt-get clean && \\
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends neofetch htop nano vim wget git tmux \\
+                       net-tools dnsutils iputils-ping ufw fail2ban && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/* || true
+
+# Install optional monitoring tools (continue on failure)
+RUN apt-get update && \\
+    (apt-get install -y --no-install-recommends nmap iotop glances iftop tcpdump || true) && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/* || true
+
+# Install optional advanced tools (continue on failure - these may not be available)
+RUN apt-get update && \\
+    (apt-get install -y --no-install-recommends btop wireguard openvpn zabbix-agent samba apache2 prometheus-node-exporter sysbench || true) && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/* || true
+
+# Try to install docker.io (optional, continue on failure)
+RUN (apt-get update && apt-get install -y --no-install-recommends docker.io && \\
+     systemctl enable docker || true) || true && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/* || true
+
+# Try to install clamav (optional, continue on failure)
+RUN (apt-get update && apt-get install -y --no-install-recommends clamav || true) && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/* || true
+
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
 """
@@ -1186,11 +1211,29 @@ def build_custom_image(base_image=DEFAULT_OS_IMAGE, dockerfile_content=None):
                     f.write(dockerfile)
            
             image_tag = f"hvm/{base_image.replace(':', '-').lower()}:latest"
-            image, logs = docker_client.images.build(path=temp_dir, tag=image_tag, rm=True, forcerm=True)
-           
-            for log in logs:
-                if 'stream' in log:
-                    logger.info(log['stream'].strip())
+            # Build with timeout and better error handling
+            try:
+                image, logs = docker_client.images.build(
+                    path=temp_dir, 
+                    tag=image_tag, 
+                    rm=True, 
+                    forcerm=True,
+                    timeout=600,  # 10 minute timeout
+                    pull=False  # Don't pull base image if it exists
+                )
+               
+                for log in logs:
+                    if 'stream' in log:
+                        logger.info(log['stream'].strip())
+                    elif 'error' in log:
+                        logger.error(f"Build error: {log['error']}")
+            except docker.errors.BuildError as e:
+                logger.error(f"Image build failed: {e}")
+                # Log build output for debugging
+                for log in e.build_log:
+                    if 'stream' in log:
+                        logger.error(f"Build log: {log['stream'].strip()}")
+                raise
            
             db.add_image({
                 'image_id': image_tag,
@@ -1533,7 +1576,25 @@ def create_vps():
                 if file and allowed_file(file.filename):
                     dockerfile_content = file.read().decode('utf-8')
 
-            image_tag = build_custom_image(os_image, dockerfile_content)
+            # Build image with better error handling
+            logger.info(f"Starting image build for {os_image}...")
+            try:
+                image_tag = build_custom_image(os_image, dockerfile_content)
+                logger.info(f"Image build completed: {image_tag}")
+            except Exception as e:
+                logger.error(f"Image build failed: {e}")
+                # Try to use existing image or base image as fallback
+                try:
+                    existing = db.get_image(os_image)
+                    if existing:
+                        image_tag = existing['image_id']
+                        logger.info(f"Using existing cached image: {image_tag}")
+                    else:
+                        # Use base image directly as last resort
+                        image_tag = os_image
+                        logger.warning(f"Using base image directly: {image_tag}")
+                except:
+                    raise ValueError(f"Image build failed and no fallback available: {e}")
 
             cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
             prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
