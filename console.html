@@ -73,13 +73,18 @@
     </div>
 
     <!-- Terminal Container -->
-    <div id="terminalContainer" class="flex-1 bg-black hidden" style="position: relative;">
+    <div id="terminalContainer" class="flex-1 bg-black hidden" style="position: relative; cursor: text;">
         <div id="terminal" class="h-full w-full p-4 font-mono text-green-400 overflow-auto" 
-             style="outline: none; position: relative;"></div>
-        <!-- Hidden input for keyboard capture -->
+             style="outline: none; position: relative; white-space: pre-wrap; word-wrap: break-word;">
+             <div id="terminalContent" style="min-height: 100%;"></div>
+        </div>
+        <!-- Transparent input field covering entire terminal for keyboard capture -->
         <input type="text" id="terminalInput" 
-               style="position: absolute; top: -9999px; left: -9999px; opacity: 0; width: 1px; height: 1px;"
-               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+               style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
+                      opacity: 0; cursor: text; z-index: 10; background: transparent; 
+                      border: none; outline: none; color: transparent; caret-color: #00ff00;"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+               placeholder="">
     </div>
 
     <!-- Disconnected State -->
@@ -155,11 +160,33 @@ socket.on('connected', (data) => {
     console.log('Console server connected:', data);
 });
 
+let currentInput = ''; // Track what user is typing
+
 socket.on('output', (data) => {
+    const terminalContent = document.getElementById('terminalContent');
     const terminal = document.getElementById('terminal');
-    if (terminal) {
-        // Append output and maintain cursor at end
-        terminal.innerHTML += data;
+    if (terminalContent && terminal) {
+        // Append output to terminal content
+        // Replace ANSI escape codes with HTML
+        let processedData = data
+            .replace(/\x1b\[32m/g, '<span style="color: #00ff00;">')  // Green
+            .replace(/\x1b\[31m/g, '<span style="color: #ff0000;">')  // Red
+            .replace(/\x1b\[33m/g, '<span style="color: #ffff00;">')  // Yellow
+            .replace(/\x1b\[34m/g, '<span style="color: #0000ff;">')  // Blue
+            .replace(/\x1b\[36m/g, '<span style="color: #00ffff;">')  // Cyan
+            .replace(/\x1b\[35m/g, '<span style="color: #ff00ff;">')  // Magenta
+            .replace(/\x1b\[0m/g, '</span>')  // Reset
+            .replace(/\x1b\[m/g, '</span>')   // Reset
+            .replace(/\x1b\[K/g, '')  // Clear to end of line
+            .replace(/\r\n/g, '<br>')
+            .replace(/\n/g, '<br>')
+            .replace(/\r/g, '')
+            .replace(/\x08/g, ''); // Remove backspace characters (we handle them locally)
+        
+        // Handle backspace sequences - remove characters before \b
+        processedData = processedData.replace(/.\x08/g, ''); // Remove char + backspace
+        
+        terminalContent.innerHTML += processedData;
         terminal.scrollTop = terminal.scrollHeight;
         
         // Show terminal and hide disconnected state
@@ -174,6 +201,8 @@ socket.on('output', (data) => {
                 const terminalInput = document.getElementById('terminalInput');
                 if (terminalInput) {
                     terminalInput.focus();
+                    terminalInput.value = ''; // Clear any stale input
+                    lastInputValue = '';
                 }
             }, 200);
         }
@@ -212,19 +241,76 @@ socket.on('shell_exit', () => {
 // Handle terminal input - use hidden input field for better keyboard capture
 const terminalInput = document.getElementById('terminalInput');
 const terminal = document.getElementById('terminal');
+const terminalContent = document.getElementById('terminalContent');
 const terminalContainer = document.getElementById('terminalContainer');
+let currentInputLine = ''; // Track current input line for display
 
 // Focus the hidden input when clicking on terminal
-terminalContainer.addEventListener('click', () => {
+terminalContainer.addEventListener('click', (e) => {
     if (isConnected && !terminalContainer.classList.contains('hidden')) {
+        e.preventDefault();
         terminalInput.focus();
     }
 });
 
-terminal.addEventListener('click', () => {
+terminal.addEventListener('click', (e) => {
     if (isConnected && !terminalContainer.classList.contains('hidden')) {
+        e.preventDefault();
         terminalInput.focus();
     }
+});
+
+// Handle input field changes - show what user is typing in real-time (local echo)
+let lastInputValue = '';
+let isEchoingInput = false; // Prevent double echo
+
+terminalInput.addEventListener('input', (e) => {
+    if (!isConnected || terminalContainer.classList.contains('hidden') || isEchoingInput) {
+        return;
+    }
+    
+    const currentValue = terminalInput.value;
+    
+    // If value increased, user typed a character - show it immediately
+    if (currentValue.length > lastInputValue.length) {
+        const newChars = currentValue.slice(lastInputValue.length);
+        if (terminalContent && newChars) {
+            // Escape HTML and add to terminal
+            const escapedChars = newChars
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/\n/g, '<br>');
+            terminalContent.innerHTML += escapedChars;
+            terminal.scrollTop = terminal.scrollHeight;
+        }
+    } else if (currentValue.length < lastInputValue.length) {
+        // Value decreased - backspace was pressed
+        // Remove characters from display
+        if (terminalContent) {
+            const charsToRemove = lastInputValue.length - currentValue.length;
+            let content = terminalContent.innerHTML;
+            // Remove last N characters (handling HTML entities)
+            for (let i = 0; i < charsToRemove; i++) {
+                // Remove last character, handling HTML entities and <br>
+                if (content.endsWith('</span>')) {
+                    // Find the span and remove it
+                    const spanStart = content.lastIndexOf('<span');
+                    if (spanStart !== -1) {
+                        content = content.slice(0, spanStart);
+                    }
+                } else if (content.endsWith('<br>')) {
+                    content = content.slice(0, -4);
+                } else {
+                    content = content.slice(0, -1);
+                }
+            }
+            terminalContent.innerHTML = content;
+            terminal.scrollTop = terminal.scrollHeight;
+        }
+    }
+    
+    lastInputValue = currentValue;
 });
 
 // Handle keyboard input through the hidden input field
@@ -233,17 +319,34 @@ terminalInput.addEventListener('keydown', (e) => {
         return;
     }
     
-    // Prevent default to avoid input field showing text
-    e.preventDefault();
-    e.stopPropagation();
-    
     let keyToSend = null;
+    let shouldPreventDefault = true;
+    let shouldShowChar = false;
     
     // Handle special keys
     if (e.key === 'Enter') {
         keyToSend = '\r\n';
+        // Show the entered line before sending (if not already shown)
+        if (terminalContent && terminalInput.value && !terminalContent.innerHTML.endsWith(terminalInput.value)) {
+            const escapedValue = terminalInput.value
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            terminalContent.innerHTML += escapedValue + '<br>';
+            terminal.scrollTop = terminal.scrollHeight;
+        }
+        // Clear input field after a moment (let browser handle it naturally)
+        setTimeout(() => {
+            terminalInput.value = '';
+            lastInputValue = '';
+        }, 10);
+        shouldPreventDefault = false; // Let browser handle Enter naturally
     } else if (e.key === 'Backspace') {
         keyToSend = '\b';
+        // Remove last character from display if input field has content
+        if (terminalInput.value.length > 0) {
+            // The input field will handle backspace, we just send it to server
+        }
     } else if (e.key === 'Delete') {
         keyToSend = '\x7f';
     } else if (e.key === 'Tab') {
@@ -259,29 +362,81 @@ terminalInput.addEventListener('keydown', (e) => {
         keyToSend = '\x1b[C';
     } else if (e.key === 'ArrowLeft') {
         keyToSend = '\x1b[D';
-    } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-        // Regular character (but not Ctrl/Cmd combinations)
+    } else if (e.key === 'Home') {
+        keyToSend = '\x1b[H';
+    } else if (e.key === 'End') {
+        keyToSend = '\x1b[F';
+    } else if (e.key === 'PageUp') {
+        keyToSend = '\x1b[5~';
+    } else if (e.key === 'PageDown') {
+        keyToSend = '\x1b[6~';
+    } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        // Regular character (but not Ctrl/Cmd/Alt combinations)
         keyToSend = e.key;
+        shouldShowChar = true; // Show character as user types
+    } else if (e.ctrlKey && e.key === 'c') {
+        // Ctrl+C - send interrupt signal
+        keyToSend = '\x03';
+    } else if (e.ctrlKey && e.key === 'd') {
+        // Ctrl+D - send EOF
+        keyToSend = '\x04';
+    } else if (e.ctrlKey && e.key === 'l') {
+        // Ctrl+L - clear screen
+        keyToSend = '\x0c';
+        if (terminalContent) {
+            terminalContent.innerHTML = '';
+        }
+    } else {
+        shouldPreventDefault = false; // Allow browser to handle other keys
     }
     
     // Send the key if we have something to send
     if (keyToSend !== null && isConnected) {
         socket.emit('input', keyToSend);
+        
+        // For regular characters, show them immediately (echo locally)
+        if (shouldShowChar && terminalContent) {
+            // Character will be shown by input event handler
+        }
+        
+        if (shouldPreventDefault) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
     }
     
-    // Clear the input field
-    terminalInput.value = '';
+    // Always update scroll to bottom
+    setTimeout(() => {
+        terminal.scrollTop = terminal.scrollHeight;
+    }, 10);
 });
 
-// Also handle global keydown for when input might not be focused
-document.addEventListener('keydown', (e) => {
-    // Only handle if terminal is visible and we're not in an input field
-    if (!isConnected || terminalContainer.classList.contains('hidden')) {
-        return;
+// Keep input focused when terminal is visible and ensure it's always ready
+setInterval(() => {
+    if (isConnected && !terminalContainer.classList.contains('hidden')) {
+        if (document.activeElement !== terminalInput) {
+            terminalInput.focus();
+        }
+        // Ensure input field is visible and clickable
+        if (terminalInput.style.opacity === '0' || terminalInput.style.opacity === '') {
+            terminalInput.style.opacity = '0';
+            terminalInput.style.pointerEvents = 'auto';
+        }
     }
-    
-    // If we're typing in the terminal area and input field is not focused, focus it
-    if (terminalContainer.contains(e.target) && document.activeElement !== terminalInput) {
+}, 100);
+
+// Also focus on any click in terminal area
+terminalContainer.addEventListener('mousedown', (e) => {
+    if (isConnected && !terminalContainer.classList.contains('hidden')) {
+        e.preventDefault();
+        terminalInput.focus();
+    }
+});
+
+// Prevent context menu on right click in terminal
+terminalContainer.addEventListener('contextmenu', (e) => {
+    if (isConnected) {
+        e.preventDefault();
         terminalInput.focus();
     }
 });
@@ -308,10 +463,35 @@ window.addEventListener('resize', () => {
     line-height: 1.2;
     white-space: pre-wrap;
     word-wrap: break-word;
+    user-select: text;
+    -webkit-user-select: text;
 }
 
 #terminal:focus {
     outline: none;
+}
+
+#terminalInput {
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    color: transparent;
+    background: transparent;
+    border: none;
+    caret-color: #00ff00; /* Green cursor */
+}
+
+#terminalInput:focus {
+    outline: none;
+}
+
+.cursor-blink {
+    animation: blink 1s infinite;
+    color: #00ff00;
+}
+
+@keyframes blink {
+    0%, 50% { opacity: 1; }
+    51%, 100% { opacity: 0; }
 }
 
 .loading-spinner {
