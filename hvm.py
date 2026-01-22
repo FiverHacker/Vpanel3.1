@@ -1003,10 +1003,12 @@ def cleanup_tunnel(vps_id, public_ip, container_id=None):
                 ], capture_output=True, text=True)
                 
                 for line in result.stdout.split('\n'):
-                    if public_ip in line:
-                        subprocess.run([
-                            'iptables', '-t', 'nat', '-D', 'POSTROUTING'
-                        ] + line.split()[2:], capture_output=True)
+                    if public_ip in line and line.strip():
+                        parts = line.split()
+                        if len(parts) > 2:
+                            subprocess.run([
+                                'iptables', '-t', 'nat', '-D', 'POSTROUTING'
+                            ] + parts[2:], capture_output=True)
                 
                 # Remove firewall rules for public IP
                 subprocess.run([
@@ -1026,9 +1028,9 @@ def cleanup_tunnel(vps_id, public_ip, container_id=None):
                     ], capture_output=True, text=True)
                     
                     for line in result.stdout.split('\n'):
-                        if container_ip in line:
+                        if container_ip in line and line.strip():
                             parts = line.split()
-                            if '-A' in parts:
+                            if len(parts) > 1 and '-A' in parts:
                                 parts[parts.index('-A')] = '-D'
                                 subprocess.run(['iptables'] + parts, capture_output=True)
                 
