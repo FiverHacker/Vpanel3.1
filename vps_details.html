@@ -133,7 +133,7 @@
                     </div>
                     <div class="flex justify-between items-center p-3 bg-gray-50 rounded">
                         <span class="font-medium">SSH Port:</span>
-                        <code class="bg-gray-100 px-2 py-1 rounded">{{ vps.port }}</code>
+                        <code class="bg-gray-100 px-2 py-1 rounded">{% if vps.public_ip %}22{% else %}{{ vps.port }}{% endif %}</code>
                     </div>
                     <div class="flex justify-between items-center p-3 bg-gray-50 rounded">
                         <span class="font-medium">Username:</span>
@@ -158,20 +158,25 @@
                         </p>
                     </div>
                     {% endif %}
-                    {% if vps.tmate_session %}
-                    <div class="flex justify-between items-center p-3 bg-purple-50 rounded border border-purple-200">
-                        <span class="font-medium text-purple-800">
-                            <i class="fas fa-terminal mr-2"></i>tmate SSH:
-                        </span>
-                        <code class="bg-purple-100 px-2 py-1 rounded text-purple-800 font-mono text-xs">{{ vps.tmate_session }}</code>
-                    </div>
                     <div class="p-3 bg-purple-50 rounded border border-purple-200">
+                        <div class="flex justify-between items-center mb-2">
+                            <span class="font-medium text-purple-800">
+                                <i class="fas fa-terminal mr-2"></i>tmate SSH:
+                            </span>
+                            <button onclick="refreshTmate('{{ vps.vps_id }}')" class="text-purple-600 hover:text-purple-800 text-sm">
+                                <i class="fas fa-sync-alt mr-1"></i>Refresh
+                            </button>
+                        </div>
+                        {% if vps.tmate_session %}
+                        <code class="bg-purple-100 px-2 py-1 rounded text-purple-800 font-mono text-xs block mb-2">{{ vps.tmate_session }}</code>
                         <p class="text-sm text-purple-800">
                             <i class="fas fa-info-circle mr-2"></i>
-                            <strong>tmate:</strong> Use this command to connect via tmate: <code class="bg-purple-100 px-1 rounded">ssh {{ vps.tmate_session }}</code>
+                            <strong>tmate:</strong> Use this command to connect: <code class="bg-purple-100 px-1 rounded">ssh {{ vps.tmate_session }}</code>
                         </p>
+                        {% else %}
+                        <p class="text-sm text-purple-500 italic" id="tmateStatus">Generating tmate session... Click Refresh to generate.</p>
+                        {% endif %}
                     </div>
-                    {% endif %}
                     <div class="p-3 bg-gray-50 rounded">
                         <div class="flex justify-between items-center mb-2">
                             <span class="font-medium">Password:</span>
@@ -203,6 +208,10 @@
                     <canvas id="resourceChart"></canvas>
                 </div>
             </div>
+            <div id="historyData" style="display:none;" 
+                 data-labels='{{ history|map(attribute='timestamp')|list|tojson|safe }}'
+                 data-cpu='{{ history|map(attribute='cpu_percent')|list|tojson|safe }}'
+                 data-memory='{{ history|map(attribute='memory_percent')|list|tojson|safe }}'></div>
             {% endif %}
         </div>
 
@@ -434,6 +443,32 @@ function togglePassword() {
 }
 
 // VPS Management Functions
+async function refreshTmate(vpsId) {
+    const statusEl = document.getElementById('tmateStatus');
+    if (statusEl) {
+        statusEl.textContent = 'Generating tmate session...';
+    }
+    
+    try {
+        const response = await fetch(`/vps/${vpsId}/refresh_tmate`, { method: 'POST' });
+        const data = await response.json();
+        if (data.tmate_session) {
+            // Reload page to show new tmate session
+            window.location.reload();
+        } else {
+            alert('Failed to generate tmate session: ' + (data.error || 'Unknown error'));
+            if (statusEl) {
+                statusEl.textContent = 'Failed to generate. Please try again.';
+            }
+        }
+    } catch (error) {
+        alert('Error: ' + error.message);
+        if (statusEl) {
+            statusEl.textContent = 'Error occurred. Please try again.';
+        }
+    }
+}
+
 async function changePassword(vpsId) {
     if (!confirm('Are you sure you want to change the VPS password?')) return;
     
@@ -603,62 +638,77 @@ async function cloneVPS(vpsId) {
 }
 
 // Chart.js for resource history
-{% if history %}
-const ctx = document.getElementById('resourceChart').getContext('2d');
-const chart = new Chart(ctx, {
-    type: 'line',
-    data: {
-        labels: {{ history|map(attribute='timestamp')|list|tojson }},
-        datasets: [
-            {
-                label: 'CPU %',
-                data: {{ history|map(attribute='cpu_percent')|list|tojson }},
-                borderColor: '#3b82f6',
-                backgroundColor: 'rgba(59, 130, 246, 0.1)',
-                tension: 0.4,
-                fill: true
-            },
-            {
-                label: 'Memory %',
-                data: {{ history|map(attribute='memory_percent')|list|tojson }},
-                borderColor: '#10b981',
-                backgroundColor: 'rgba(16, 185, 129, 0.1)',
-                tension: 0.4,
-                fill: true
+(function() {
+    var chartElement = document.getElementById('resourceChart');
+    var dataElement = document.getElementById('historyData');
+    
+    if (chartElement && dataElement) {
+        try {
+            var labels = JSON.parse(dataElement.getAttribute('data-labels') || '[]');
+            var cpuData = JSON.parse(dataElement.getAttribute('data-cpu') || '[]');
+            var memoryData = JSON.parse(dataElement.getAttribute('data-memory') || '[]');
+            var ctx = chartElement.getContext('2d');
+            
+            if (labels.length > 0) {
+                var chart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            {
+                                label: 'CPU %',
+                                data: cpuData,
+                                borderColor: '#3b82f6',
+                                backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                                tension: 0.4,
+                                fill: true
+                            },
+                            {
+                                label: 'Memory %',
+                                data: memoryData,
+                                borderColor: '#10b981',
+                                backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                                tension: 0.4,
+                                fill: true
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                max: 100,
+                                title: {
+                                    display: true,
+                                    text: 'Usage %'
+                                }
+                            },
+                            x: {
+                                title: {
+                                    display: true,
+                                    text: 'Time'
+                                }
+                            }
+                        },
+                        plugins: {
+                            legend: {
+                                position: 'top'
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        }
+                    }
+                });
             }
-        ]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-            y: {
-                beginAtZero: true,
-                max: 100,
-                title: {
-                    display: true,
-                    text: 'Usage %'
-                }
-            },
-            x: {
-                title: {
-                    display: true,
-                    text: 'Time'
-                }
-            }
-        },
-        plugins: {
-            legend: {
-                position: 'top',
-            },
-            tooltip: {
-                mode: 'index',
-                intersect: false
-            }
+        } catch (e) {
+            console.error('Error initializing chart:', e);
         }
     }
-});
-{% endif %}
+})();
 </script>
 
 <style>

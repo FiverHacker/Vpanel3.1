@@ -1320,13 +1320,18 @@ def setup_container(container_id, memory, vps_id, ssh_port, root_password, water
             logger.warning(f"Watermark set failed: {stderr}")
        
         # Configure SSH to listen on all interfaces (0.0.0.0) to accept connections via public IP
+        # This is critical for public IP tunnel to work
         ssh_config_cmd = "sed -i 's/#ListenAddress 0.0.0.0/ListenAddress 0.0.0.0/' /etc/ssh/sshd_config && " \
-                        "sed -i 's/ListenAddress /#ListenAddress /' /etc/ssh/sshd_config && " \
-                        "echo 'ListenAddress 0.0.0.0' >> /etc/ssh/sshd_config && " \
-                        "systemctl restart ssh || systemctl restart sshd"
+                        "sed -i 's/^ListenAddress /#ListenAddress /' /etc/ssh/sshd_config && " \
+                        "grep -q '^ListenAddress 0.0.0.0' /etc/ssh/sshd_config || echo 'ListenAddress 0.0.0.0' >> /etc/ssh/sshd_config && " \
+                        "sed -i 's/#Port 22/Port 22/' /etc/ssh/sshd_config && " \
+                        "grep -q '^Port 22' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config && " \
+                        "systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || /etc/init.d/ssh restart 2>/dev/null"
         success, _, stderr = run_docker_command(container_id, ["bash", "-c", ssh_config_cmd])
         if not success:
             logger.warning(f"SSH config update failed: {stderr}")
+        else:
+            logger.info(f"SSH configured to listen on 0.0.0.0:22 for container {container_id}")
         
         security_cmds = [
             "systemctl enable fail2ban && systemctl start fail2ban",
@@ -2605,6 +2610,31 @@ def change_vps_password(vps_id):
         logger.error(f"Change password error: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/vps/<vps_id>/refresh_tmate', methods=['POST'])
+@login_required
+def refresh_tmate(vps_id):
+    token, vps = db.get_vps_by_id(vps_id)
+    if not vps or (vps['created_by'] != current_user.id and not is_admin(current_user)):
+        return jsonify({'error': 'Access denied'}), 403
+   
+    try:
+        container = docker_client.containers.get(vps['container_id'])
+        if container.status != 'running':
+            return jsonify({'error': 'VPS is not running'}), 400
+       
+        # Wait a bit for container to be ready
+        time.sleep(2)
+        tmate_session = get_tmate_session(vps['container_id'])
+        if tmate_session:
+            db.update_vps(token, {'tmate_session': tmate_session})
+            db.log_action(current_user.id, 'refresh_tmate', f'Refreshed tmate session for VPS {vps_id}')
+            return jsonify({'tmate_session': tmate_session, 'message': 'tmate session generated'})
+        else:
+            return jsonify({'error': 'Failed to generate tmate session. Make sure tmate is installed in the container.'}), 500
+    except Exception as e:
+        logger.error(f"Refresh tmate error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/vps/<vps_id>/upgrade', methods=['POST'])
 @login_required
 @admin_required
@@ -3508,51 +3538,92 @@ def start_shell(data):
         emit('error', 'Access denied')
         return
    
+    sid = request.sid
+    
+    # Check if container exists and is running
     try:
         container = docker_client.containers.get(vps['container_id'])
         if container.status != 'running':
-            emit('error', 'Container not running')
+            emit('error', f'Container is not running. Current status: {container.status}. Please start the VPS first.')
             return
-    except Exception as e:
-        logger.error(f"Console error: {e}")
-        emit('error', 'Container not found')
+    except docker.errors.NotFound:
+        emit('error', 'Container not found. The VPS may have been deleted.')
         return
-   
-    sid = request.sid
+    except Exception as e:
+        logger.error(f"Container check error: {e}")
+        emit('error', f'Failed to access container: {str(e)}')
+        return
     
     # Use docker exec with subprocess for cross-platform compatibility
     try:
-        process = subprocess.Popen(
-            ['docker', 'exec', '-i', vps['container_id'], '/bin/bash'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=0
-        )
+        # Try bash first, fallback to sh if bash doesn't exist
+        process = None
+        for shell in ['/bin/bash', '/bin/sh', 'bash', 'sh']:
+            try:
+                process = subprocess.Popen(
+                    ['docker', 'exec', '-i', '-t', vps['container_id'], shell],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+                # Test if process started successfully
+                if process.poll() is None:
+                    break
+                else:
+                    process = None
+            except Exception as shell_error:
+                logger.debug(f"Shell {shell} failed: {shell_error}")
+                continue
+        
+        if not process:
+            emit('error', 'No suitable shell found in container. Container may not be properly initialized.')
+            return
         
         console_sessions[sid] = {'process': process, 'vps_id': vps_id}
+        
+        # Send initial connection message
+        emit('output', '\r\n\x1b[32m✓ Connected to container console...\x1b[0m\r\n')
         
         def reader():
             try:
                 while True:
                     if sid not in console_sessions:
                         break
-                    output = process.stdout.readline()
-                    if not output and process.poll() is not None:
+                    if process.poll() is not None:
                         break
-                    if output:
-                        emit('output', output)
+                    try:
+                        # Read character by character for better responsiveness
+                        char = process.stdout.read(1)
+                        if char:
+                            emit('output', char)
+                        elif process.poll() is not None:
+                            break
+                    except Exception as read_error:
+                        logger.error(f"Read error: {read_error}")
+                        break
             except Exception as e:
                 logger.error(f"Console reader error: {e}")
             finally:
                 if sid in console_sessions:
+                    try:
+                        process.terminate()
+                        process.wait(timeout=2)
+                    except:
+                        try:
+                            process.kill()
+                        except:
+                            pass
                     del console_sessions[sid]
                 emit('shell_exit')
         
         threading.Thread(target=reader, daemon=True).start()
     except Exception as e:
         logger.error(f"Console start error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         emit('error', f'Failed to start console: {str(e)}')
 
 @socketio.on('input', namespace='/console')
