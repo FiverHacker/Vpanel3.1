@@ -74,7 +74,8 @@
 
     <!-- Terminal Container -->
     <div id="terminalContainer" class="flex-1 bg-black hidden">
-        <div id="terminal" class="h-full w-full p-4 font-mono text-green-400 overflow-auto"></div>
+        <div id="terminal" class="h-full w-full p-4 font-mono text-green-400 overflow-auto" 
+             tabindex="0" contenteditable="false" style="outline: none;"></div>
     </div>
 
     <!-- Disconnected State -->
@@ -153,6 +154,7 @@ socket.on('connected', (data) => {
 socket.on('output', (data) => {
     const terminal = document.getElementById('terminal');
     if (terminal) {
+        // Append output and maintain cursor at end
         terminal.innerHTML += data;
         terminal.scrollTop = terminal.scrollHeight;
         
@@ -161,6 +163,13 @@ socket.on('output', (data) => {
         document.getElementById('disconnectedState').classList.add('hidden');
         document.getElementById('connectionStatus').classList.remove('hidden');
         document.getElementById('connectionForm').classList.add('hidden');
+        
+        // Auto-focus terminal when output is received
+        if (!isConnected) {
+            setTimeout(() => {
+                terminal.focus();
+            }, 100);
+        }
         
         isConnected = true;
     }
@@ -201,7 +210,9 @@ document.getElementById('terminalContainer').addEventListener('click', () => {
     }
 });
 
-// Handle keyboard input
+// Handle keyboard input - improved version
+let terminalInputBuffer = '';
+
 document.addEventListener('keydown', (e) => {
     const terminal = document.getElementById('terminal');
     const terminalContainer = document.getElementById('terminalContainer');
@@ -211,12 +222,45 @@ document.addEventListener('keydown', (e) => {
         return;
     }
     
-    // If terminal is focused or we're typing anywhere in the terminal container
+    // Focus terminal if clicking on container
+    if (terminalContainer.contains(e.target) && document.activeElement !== terminal) {
+        terminal.focus();
+    }
+    
+    // Only process if terminal is focused or we're in the container
     if (document.activeElement === terminal || terminalContainer.contains(document.activeElement)) {
-        socket.emit('input', e.key);
-        // Don't prevent default for special keys like Tab, but allow normal typing
-        if (e.key.length === 1 || ['Enter', 'Backspace', 'Delete'].includes(e.key)) {
-            // Let the terminal handle it naturally through socket
+        // Prevent default for most keys to avoid browser behavior
+        e.preventDefault();
+        
+        let keyToSend = null;
+        
+        // Handle special keys
+        if (e.key === 'Enter') {
+            keyToSend = '\r\n';
+        } else if (e.key === 'Backspace') {
+            keyToSend = '\b';
+        } else if (e.key === 'Delete') {
+            keyToSend = '\x7f';
+        } else if (e.key === 'Tab') {
+            keyToSend = '\t';
+        } else if (e.key === 'Escape') {
+            keyToSend = '\x1b';
+        } else if (e.key === 'ArrowUp') {
+            keyToSend = '\x1b[A';
+        } else if (e.key === 'ArrowDown') {
+            keyToSend = '\x1b[B';
+        } else if (e.key === 'ArrowRight') {
+            keyToSend = '\x1b[C';
+        } else if (e.key === 'ArrowLeft') {
+            keyToSend = '\x1b[D';
+        } else if (e.key.length === 1) {
+            // Regular character
+            keyToSend = e.key;
+        }
+        
+        // Send the key if we have something to send
+        if (keyToSend !== null && isConnected) {
+            socket.emit('input', keyToSend);
         }
     }
 });

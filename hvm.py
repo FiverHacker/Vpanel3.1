@@ -908,6 +908,22 @@ def allocate_public_ip(vps_id):
             if creating_vps_id != vps_id and progress.get('public_ip'):
                 used_ips.add(progress['public_ip'])
         
+        # Also check IPs actually configured on the system
+        if sys.platform != "win32":
+            try:
+                result = subprocess.run(['ip', 'addr', 'show'], 
+                                       capture_output=True, text=True, check=True)
+                for line in result.stdout.split('\n'):
+                    if 'inet ' in line and PUBLIC_IP_POOL_START.split('.')[0] in line:
+                        # Extract IP from line like "inet 10.0.0.2/32 scope global"
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            ip_part = parts[1].split('/')[0]
+                            if ip_part:
+                                used_ips.add(ip_part)
+            except Exception as ip_check_error:
+                logger.debug(f"Could not check system IPs: {ip_check_error}")
+        
         # Find next available IP in pool
         start_int = ip_to_int(PUBLIC_IP_POOL_START)
         end_int = ip_to_int(PUBLIC_IP_POOL_END)
@@ -916,6 +932,10 @@ def allocate_public_ip(vps_id):
         max_attempts = min(1000, end_int - start_int + 1)
         attempts = 0
         current_int = start_int
+        
+        # Skip the first IP (usually gateway)
+        if current_int == ip_to_int(PUBLIC_IP_POOL_START):
+            current_int += 1
         
         while attempts < max_attempts:
             ip = int_to_ip(current_int)
@@ -928,18 +948,22 @@ def allocate_public_ip(vps_id):
                         conflict = True
                         break
                 if not conflict:
-                    logger.info(f"Allocated unique public IP {ip} for VPS {vps_id}")
+                    logger.info(f"✓ Allocated unique public IP {ip} for VPS {vps_id}")
                     return ip
             
             current_int += 1
             if current_int > end_int:
-                current_int = start_int
+                current_int = start_int + 1  # Skip start IP
             attempts += 1
         
-        logger.error(f"No available IPs in pool for VPS {vps_id}")
+        logger.error(f"✗ No available IPs in pool for VPS {vps_id} (checked {attempts} IPs)")
+        logger.error(f"  Pool: {PUBLIC_IP_POOL_START} - {PUBLIC_IP_POOL_END}")
+        logger.error(f"  Used IPs: {len(used_ips)}")
         return None
     except Exception as e:
         logger.error(f"IP allocation error for VPS {vps_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
 
 def setup_tunnel(vps_id, public_ip, container_id):
@@ -967,10 +991,68 @@ def setup_tunnel(vps_id, public_ip, container_id):
         # This creates a transparent tunnel where public IP traffic is routed to container
         if sys.platform != "win32":
             try:
-                # Enable IP forwarding
+                # Enable IP forwarding permanently
                 subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=True, capture_output=True)
+                # Make it persistent
+                with open('/etc/sysctl.conf', 'a') as f:
+                    f.write('\nnet.ipv4.ip_forward=1\n')
                 
-                # Add DNAT rule to forward all traffic from public IP to container IP (VPN-like)
+                # Find the main network interface (not loopback)
+                # Try common interface names
+                main_interface = None
+                for iface in ['eth0', 'ens33', 'ens3', 'enp0s3', 'enp1s0', 'eth1']:
+                    try:
+                        result = subprocess.run(['ip', 'link', 'show', iface], 
+                                               capture_output=True, check=False)
+                        if result.returncode == 0:
+                            main_interface = iface
+                            break
+                    except:
+                        continue
+                
+                # If no common interface found, try to get default route interface
+                if not main_interface:
+                    try:
+                        result = subprocess.run(['ip', 'route', 'show', 'default'], 
+                                               capture_output=True, text=True, check=True)
+                        for line in result.stdout.split('\n'):
+                            if 'dev' in line:
+                                parts = line.split()
+                                if 'dev' in parts:
+                                    idx = parts.index('dev')
+                                    if idx + 1 < len(parts):
+                                        main_interface = parts[idx + 1]
+                                        break
+                    except:
+                        pass
+                
+                # Fallback to first non-loopback interface
+                if not main_interface:
+                    try:
+                        result = subprocess.run(['ip', 'link', 'show'], 
+                                               capture_output=True, text=True, check=True)
+                        for line in result.stdout.split('\n'):
+                            if ': ' in line and 'lo:' not in line and 'state' not in line:
+                                iface = line.split(': ')[1].split('@')[0].strip()
+                                if iface and iface != 'lo':
+                                    main_interface = iface
+                                    break
+                    except:
+                        pass
+                
+                if not main_interface:
+                    logger.warning("Could not determine main network interface, using eth0")
+                    main_interface = 'eth0'
+                
+                logger.info(f"Using network interface: {main_interface} for IP {public_ip}")
+                
+                # Add the public IP to the main network interface
+                # This allows the host to receive traffic for this IP
+                subprocess.run([
+                    'ip', 'addr', 'add', f'{public_ip}/32', 'dev', main_interface
+                ], capture_output=True, check=False)  # May fail if already exists, that's OK
+                
+                # Add DNAT rule to forward all traffic from public IP to container IP
                 subprocess.run([
                     'iptables', '-t', 'nat', '-A', 'PREROUTING',
                     '-d', public_ip, '-j', 'DNAT', '--to-destination', container_ip
@@ -982,7 +1064,7 @@ def setup_tunnel(vps_id, public_ip, container_id):
                     '-s', container_ip, '-j', 'SNAT', '--to-source', public_ip
                 ], check=True, capture_output=True)
                 
-                # Allow all traffic to/from public IP (VPN tunnel behavior)
+                # Allow all traffic to/from public IP
                 subprocess.run([
                     'iptables', '-A', 'INPUT',
                     '-d', public_ip, '-j', 'ACCEPT'
@@ -993,7 +1075,7 @@ def setup_tunnel(vps_id, public_ip, container_id):
                     '-s', public_ip, '-j', 'ACCEPT'
                 ], check=True, capture_output=True)
                 
-                # Forward traffic between public IP and container (VPN tunnel)
+                # Forward traffic between public IP and container
                 subprocess.run([
                     'iptables', '-A', 'FORWARD',
                     '-d', container_ip, '-j', 'ACCEPT'
@@ -1004,22 +1086,33 @@ def setup_tunnel(vps_id, public_ip, container_id):
                     '-s', container_ip, '-j', 'ACCEPT'
                 ], check=True, capture_output=True)
                 
-                # Configure container to use public IP as source
-                # This makes the container appear to have the public IP
-                subprocess.run([
-                    'ip', 'addr', 'add', f'{public_ip}/32', 'dev', 'lo'
-                ], capture_output=True)  # May fail if already exists, that's OK
+                # Also add the IP to the container's network namespace
+                # This makes the container think it has the public IP
+                try:
+                    # Get container's PID
+                    container.reload()
+                    pid = container.attrs.get('State', {}).get('Pid')
+                    if pid:
+                        # Add IP to container's network namespace
+                        subprocess.run([
+                            'nsenter', '-t', str(pid), '-n', 'ip', 'addr', 'add',
+                            f'{public_ip}/32', 'dev', 'lo'
+                        ], capture_output=True, check=False)
+                except Exception as ns_error:
+                    logger.debug(f"Could not add IP to container namespace: {ns_error}")
                 
-                logger.info(f"VPN tunnel setup complete: {public_ip} <-> {container_ip} (VPS {vps_id})")
-                logger.info(f"All services accessible on {public_ip} (SSH, HTTP, etc.)")
+                logger.info(f"✓ Tunnel setup complete: {public_ip} <-> {container_ip} (VPS {vps_id})")
+                logger.info(f"✓ All services accessible on {public_ip} (SSH, HTTP, etc.)")
+                logger.info(f"✓ Interface: {main_interface}")
                 return True
             except subprocess.CalledProcessError as e:
-                logger.warning(f"iptables setup failed (may need root): {e}")
-                # Continue anyway - routing might be handled by Docker
-                return True
-            except FileNotFoundError:
-                logger.warning("iptables not found - tunnel routing may not work")
-                return True
+                logger.error(f"iptables setup failed (may need root/sudo): {e}")
+                logger.error(f"Error output: {e.stderr.decode() if e.stderr else 'No error output'}")
+                return False
+            except FileNotFoundError as e:
+                logger.error(f"Required tool not found: {e}")
+                logger.error("Please install: iptables, iproute2")
+                return False
         else:
             # Windows - use netsh or Docker port mapping
             logger.info(f"Tunnel configured: {public_ip} -> {container_ip} (VPS {vps_id})")
@@ -1078,10 +1171,27 @@ def cleanup_tunnel(vps_id, public_ip, container_id=None):
                     '-s', public_ip, '-j', 'ACCEPT'
                 ], capture_output=True)
                 
-                # Remove IP address from loopback
-                subprocess.run([
-                    'ip', 'addr', 'del', f'{public_ip}/32', 'dev', 'lo'
-                ], capture_output=True)  # May fail if not exists, that's OK
+                # Remove IP address from all interfaces
+                # Try common interfaces
+                for iface in ['eth0', 'ens33', 'ens3', 'enp0s3', 'enp1s0', 'eth1', 'lo']:
+                    subprocess.run([
+                        'ip', 'addr', 'del', f'{public_ip}/32', 'dev', iface
+                    ], capture_output=True)  # May fail if not exists, that's OK
+                
+                # Also try to find which interface has the IP
+                try:
+                    result = subprocess.run(['ip', 'addr', 'show'], 
+                                           capture_output=True, text=True, check=True)
+                    for line in result.stdout.split('\n'):
+                        if public_ip in line and 'inet' in line:
+                            # Extract interface name from previous lines
+                            parts = line.split()
+                            if len(parts) > 1:
+                                subprocess.run([
+                                    'ip', 'addr', 'del', f'{public_ip}/32', 'dev', iface
+                                ], capture_output=True)
+                except:
+                    pass
                 
                 # Remove forwarding rules if we have container IP
                 if container_ip:
@@ -1493,6 +1603,14 @@ echo "Resource limits configured: {cpu_count} CPUs, {memory_mb}MB RAM"
         else:
             logger.info(f"Configured container to show {cpu_count} CPUs and {memory_mb}MB RAM")
         
+        # Ensure tmate is installed and working
+        tmate_install_cmd = "which tmate >/dev/null 2>&1 || (apt-get update && apt-get install -y tmate) || true"
+        success, _, stderr = run_docker_command(container_id, ["bash", "-c", tmate_install_cmd])
+        if not success:
+            logger.warning(f"tmate installation check failed: {stderr}")
+        else:
+            logger.info(f"tmate is available in container {container_id}")
+        
         security_cmds = [
             "systemctl enable fail2ban && systemctl start fail2ban",
             "apt-get update && apt-get upgrade -y",
@@ -1516,20 +1634,110 @@ echo "Resource limits configured: {cpu_count} CPUs, {memory_mb}MB RAM"
 
 def get_tmate_session(container_id):
     try:
-        process = subprocess.Popen(["docker", "exec", container_id, "tmate", "-F"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # First, check if tmate is installed
+        check_cmd = subprocess.run(
+            ["docker", "exec", container_id, "which", "tmate"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if check_cmd.returncode != 0:
+            # tmate is not installed, try to install it
+            logger.info(f"tmate not found in container {container_id}, attempting to install...")
+            install_cmd = subprocess.run(
+                ["docker", "exec", container_id, "bash", "-c", 
+                 "apt-get update && apt-get install -y tmate || (apt-get update && apt-get install -y tmate) || true"],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if install_cmd.returncode != 0:
+                logger.warning(f"Failed to install tmate in container {container_id}: {install_cmd.stderr}")
+                return None
+        
+        # Now try to get tmate session using tmate -F (foreground mode)
+        # This is the standard way to get a tmate session
+        process = subprocess.Popen(
+            ["docker", "exec", "-i", container_id, "timeout", "15", "tmate", "-F"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        
         start = time.time()
         session = None
-        while time.time() - start < 10:
-            line = process.stdout.readline()
-            if line and "ssh session:" in line:
-                parts = line.split("ssh session:")
-                if len(parts) > 1:
-                    session = parts[1].strip()
-                    break
-        process.terminate()
-        return session
+        output_lines = []
+        
+        # Read output for up to 15 seconds
+        while time.time() - start < 15:
+            if process.poll() is not None:
+                # Process finished, read remaining output
+                remaining = process.stdout.read()
+                if remaining:
+                    output_lines.extend(remaining.split('\n'))
+                break
+            
+            try:
+                line = process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    output_lines.append(line)
+                    
+                    # Look for SSH session in various formats that tmate outputs
+                    if "ssh session:" in line.lower():
+                        # Format: "ssh session: user@host.tmate.io"
+                        parts = line.split("ssh session:", 1) if "ssh session:" in line else line.split("SSH session:", 1)
+                        if len(parts) > 1:
+                            session = parts[1].strip()
+                            # Clean up any extra characters
+                            session = session.strip('"').strip("'").strip()
+                            break
+                    elif "ssh " in line.lower() and "@" in line and "tmate.io" in line:
+                        # Format: "ssh user@host.tmate.io"
+                        if "ssh " in line:
+                            parts = line.split("ssh ", 1)
+                            if len(parts) > 1:
+                                session = parts[1].strip()
+                                session = session.strip('"').strip("'").strip()
+                                break
+                    elif "@" in line and "tmate.io" in line and not session:
+                        # Just the connection string: "user@host.tmate.io"
+                        session = line.strip()
+                        session = session.strip('"').strip("'").strip()
+                        break
+            except Exception as read_error:
+                logger.debug(f"Error reading tmate output: {read_error}")
+                break
+        
+        # Clean up process if still running
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except:
+                process.kill()
+        
+        if session:
+            # Final cleanup of session string
+            session = session.strip()
+            # Remove any leading "ssh " if present
+            if session.startswith("ssh "):
+                session = session[4:].strip()
+            logger.info(f"Successfully got tmate session for container {container_id}: {session[:50]}...")
+            return session
+        else:
+            logger.warning(f"Could not extract tmate session. Output: {output_lines[:10]}")
+            return None
+            
+    except subprocess.TimeoutExpired:
+        logger.error(f"tmate session generation timed out for container {container_id}")
+        return None
     except Exception as e:
-        logger.error(f"tmate error: {e}")
+        logger.error(f"tmate error for container {container_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
 
 def allowed_file(filename):
@@ -2828,18 +3036,41 @@ def refresh_tmate(vps_id):
         if container.status != 'running':
             return jsonify({'error': 'VPS is not running'}), 400
        
+        # Ensure tmate is installed first
+        install_check = subprocess.run(
+            ["docker", "exec", vps['container_id'], "bash", "-c", 
+             "which tmate >/dev/null 2>&1 || (apt-get update && apt-get install -y tmate)"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        if install_check.returncode != 0:
+            logger.warning(f"tmate installation failed: {install_check.stderr}")
+            # Continue anyway, maybe it's already installed
+        
         # Wait a bit for container to be ready
-        time.sleep(2)
+        time.sleep(3)
         tmate_session = get_tmate_session(vps['container_id'])
         if tmate_session:
             db.update_vps(token, {'tmate_session': tmate_session})
             db.log_action(current_user.id, 'refresh_tmate', f'Refreshed tmate session for VPS {vps_id}')
             return jsonify({'tmate_session': tmate_session, 'message': 'tmate session generated'})
         else:
-            return jsonify({'error': 'Failed to generate tmate session. Make sure tmate is installed in the container.'}), 500
+            # Try one more time with longer wait
+            time.sleep(5)
+            tmate_session = get_tmate_session(vps['container_id'])
+            if tmate_session:
+                db.update_vps(token, {'tmate_session': tmate_session})
+                db.log_action(current_user.id, 'refresh_tmate', f'Refreshed tmate session for VPS {vps_id}')
+                return jsonify({'tmate_session': tmate_session, 'message': 'tmate session generated'})
+            else:
+                return jsonify({'error': 'Failed to generate tmate session. The container may not have network access to tmate.io servers, or tmate installation failed.'}), 500
     except Exception as e:
         logger.error(f"Refresh tmate error: {e}")
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Failed to generate tmate session: {str(e)}'}), 500
 
 @app.route('/vps/<vps_id>/upgrade', methods=['POST'])
 @login_required
@@ -3815,6 +4046,20 @@ def start_shell(data):
         # Send initial connection message
         emit('output', '\r\n\x1b[32m✓ Connected to container console...\x1b[0m\r\n')
         
+        # Trigger shell prompt by sending a newline after a short delay
+        def trigger_prompt():
+            time.sleep(0.3)
+            if sid in console_sessions and console_sessions[sid].get('process'):
+                try:
+                    proc = console_sessions[sid]['process']
+                    if proc and proc.stdin and proc.poll() is None:
+                        proc.stdin.write('\n')
+                        proc.stdin.flush()
+                except Exception as e:
+                    logger.debug(f"Could not trigger prompt: {e}")
+        
+        threading.Thread(target=trigger_prompt, daemon=True).start()
+        
         def reader():
             try:
                 import select
@@ -3902,8 +4147,12 @@ def handle_input(data):
         
         if process and process.stdin:
             try:
-                process.stdin.write(data)
-                process.stdin.flush()
+                # Write the input data to the process stdin
+                if isinstance(data, str):
+                    process.stdin.write(data)
+                    process.stdin.flush()
+                else:
+                    logger.warning(f"Received non-string input: {type(data)}")
             except BrokenPipeError:
                 logger.error(f"Broken pipe for session {sid}")
                 emit('error', 'Connection lost. Please reconnect.')
@@ -3911,6 +4160,8 @@ def handle_input(data):
                     del console_sessions[sid]
             except Exception as write_error:
                 logger.error(f"Error writing to stdin: {write_error}")
+                import traceback
+                logger.error(traceback.format_exc())
                 emit('error', 'Failed to send input')
         else:
             logger.error(f"Process or stdin is None for session {sid}")
