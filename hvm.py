@@ -1573,7 +1573,38 @@ def create_vps_async(vps_data, user_id, current_user_id):
         
         # Create container
         vps_creation_progress[vps_id] = {'status': 'creating', 'progress': 50, 'message': 'Creating container...'}
+        
+        # Re-check ports from actual Docker containers before creating
+        docker_used_ports = set()
+        try:
+            for container in docker_client.containers.list(all=True):
+                if container.attrs.get('NetworkSettings') and container.attrs['NetworkSettings'].get('Ports'):
+                    for port_binding in container.attrs['NetworkSettings']['Ports'].values():
+                        if port_binding:
+                            for binding in port_binding:
+                                if binding.get('HostPort'):
+                                    try:
+                                        docker_used_ports.add(int(binding['HostPort']))
+                                    except (ValueError, TypeError):
+                                        pass
+        except Exception as e:
+            logger.warning(f"Error checking Docker ports: {e}")
+        
         ports = {'22/tcp': ssh_port}
+        if ssh_port in docker_used_ports:
+            # SSH port conflict - find a new one
+            logger.warning(f"SSH port {ssh_port} is already in use by Docker, finding alternative...")
+            new_ssh_port = random.randint(20000, 30000)
+            attempts = 0
+            while new_ssh_port in docker_used_ports and attempts < 100:
+                new_ssh_port = random.randint(20000, 30000)
+                attempts += 1
+            if new_ssh_port in docker_used_ports:
+                raise ValueError(f'Could not find available SSH port. Port {ssh_port} is in use.')
+            ssh_port = new_ssh_port
+            ports = {'22/tcp': ssh_port}
+            vps_data['port'] = ssh_port  # Update in vps_data too
+        
         if additional_ports:
             for port_str in additional_ports.split(','):
                 if port_str.strip():
@@ -1581,8 +1612,13 @@ def create_vps_async(vps_data, user_id, current_user_id):
                     if len(port_parts) == 2:
                         host, cont = port_parts
                         try:
-                            ports[f'{cont}/tcp'] = int(host)
-                        except:
+                            host_port = int(host)
+                            if host_port in docker_used_ports:
+                                raise ValueError(f"Port {host_port} is already in use by another Docker container")
+                            ports[f'{cont}/tcp'] = host_port
+                        except ValueError as e:
+                            if 'already in use' in str(e):
+                                raise
                             pass
         
         cpuset = f"0-{cpu-1}" if cpu > 1 else "0"
@@ -1603,22 +1639,52 @@ def create_vps_async(vps_data, user_id, current_user_id):
         except docker.errors.NotFound:
             pass  # Good, name is available
         
-        container = docker_client.containers.run(
-            image_tag,
-            name=container_name,  # Set explicit name for uniqueness
-            detach=True,
-            privileged=True,
-            hostname=f"{prefix}{vps_id}",
-            mem_limit=f"{memory}g",
-            nano_cpus=cpu * 10**9,
-            cpuset_cpus=cpuset,
-            cap_add=["SYS_ADMIN", "NET_ADMIN"],
-            security_opt=["seccomp=unconfined"],
-            network=DOCKER_NETWORK,
-            volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
-            restart_policy={"Name": "always"},
-            ports=ports
-        )
+        try:
+            container = docker_client.containers.run(
+                image_tag,
+                name=container_name,  # Set explicit name for uniqueness
+                detach=True,
+                privileged=True,
+                hostname=f"{prefix}{vps_id}",
+                mem_limit=f"{memory}g",
+                nano_cpus=cpu * 10**9,
+                cpuset_cpus=cpuset,
+                cap_add=["SYS_ADMIN", "NET_ADMIN"],
+                security_opt=["seccomp=unconfined"],
+                network=DOCKER_NETWORK,
+                volumes={f'hvm-{vps_id}': {'bind': '/data', 'mode': 'rw'}},
+                restart_policy={"Name": "always"},
+                ports=ports
+            )
+        except docker.errors.APIError as e:
+            error_msg = str(e)
+            if 'port is already allocated' in error_msg or 'Bind for' in error_msg or 'port is already in use' in error_msg.lower():
+                # Extract port from error message
+                import re
+                port_match = re.search(r':(\d+)', error_msg)
+                if port_match:
+                    conflict_port = port_match.group(1)
+                    vps_creation_progress[vps_id] = {
+                        'status': 'error', 
+                        'progress': 0, 
+                        'message': f'Port {conflict_port} is already allocated. Please choose a different port or wait for the port to be released.'
+                    }
+                    raise ValueError(f"Port {conflict_port} is already allocated. Please choose a different port.")
+            vps_creation_progress[vps_id] = {
+                'status': 'error', 
+                'progress': 0, 
+                'message': f'Failed to create container: {error_msg}'
+            }
+            raise ValueError(f"Failed to create container: {error_msg}")
+        except Exception as e:
+            error_msg = str(e)
+            if 'port' in error_msg.lower() and ('allocated' in error_msg.lower() or 'in use' in error_msg.lower()):
+                vps_creation_progress[vps_id] = {
+                    'status': 'error', 
+                    'progress': 0, 
+                    'message': f'Port conflict: {error_msg}'
+                }
+            raise
         
         time.sleep(3)
         container.reload()
@@ -1836,12 +1902,23 @@ def create_vps():
             # Get from Docker containers (in case DB is out of sync)
             try:
                 for container in docker_client.containers.list(all=True):
-                    if container.name.startswith('hvm-') or container.name.startswith(prefix):
+                    if container.name.startswith('hvm-') or (prefix and container.name.startswith(prefix)):
                         used_vps_ids.add(container.name.replace('hvm-', '').replace(prefix, ''))
-            except:
+                    # Check actual port bindings from Docker
+                    if container.attrs.get('NetworkSettings') and container.attrs['NetworkSettings'].get('Ports'):
+                        for port_binding in container.attrs['NetworkSettings']['Ports'].values():
+                            if port_binding:
+                                for binding in port_binding:
+                                    if binding.get('HostPort'):
+                                        try:
+                                            used_ports.add(int(binding['HostPort']))
+                                        except (ValueError, TypeError):
+                                            pass
+            except Exception as e:
+                logger.warning(f"Error checking Docker containers for ports: {e}")
                 pass
 
-            # Generate unique SSH port
+            # Generate unique SSH port (check both DB and Docker)
             ssh_port = random.randint(20000, 30000)
             attempts = 0
             while ssh_port in used_ports and attempts < 100:
@@ -1850,7 +1927,7 @@ def create_vps():
             if ssh_port in used_ports:
                 raise ValueError('Could not find available SSH port')
             
-            # Validate additional ports are unique
+            # Validate additional ports are unique (check both DB and Docker)
             if additional_ports:
                 for port_str in additional_ports.split(','):
                     if port_str.strip():
@@ -1859,7 +1936,7 @@ def create_vps():
                             try:
                                 host_port = int(port_parts[0])
                                 if host_port in used_ports:
-                                    raise ValueError(f"Port {host_port} is already in use")
+                                    raise ValueError(f"Port {host_port} is already in use (checked database and Docker containers)")
                                 used_ports.add(host_port)  # Reserve it
                             except ValueError as e:
                                 if 'already in use' in str(e):
