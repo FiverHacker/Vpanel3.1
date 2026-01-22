@@ -77,6 +77,8 @@
         <div id="terminal" class="h-full w-full p-4 font-mono text-green-400 overflow-auto" 
              style="outline: none; position: relative; white-space: pre-wrap; word-wrap: break-word;">
              <div id="terminalContent" style="min-height: 100%;"></div>
+             <!-- Visible cursor that blinks -->
+             <span id="terminalCursor" class="cursor-blink" style="color: #00ff00; background: #00ff00; width: 8px; display: inline-block;">█</span>
         </div>
         <!-- Transparent input field covering entire terminal for keyboard capture -->
         <input type="text" id="terminalInput" 
@@ -165,6 +167,7 @@ let currentInput = ''; // Track what user is typing
 socket.on('output', (data) => {
     const terminalContent = document.getElementById('terminalContent');
     const terminal = document.getElementById('terminal');
+    const terminalCursor = document.getElementById('terminalCursor');
     if (terminalContent && terminal) {
         // Append output to terminal content
         // Replace ANSI escape codes with HTML
@@ -186,7 +189,18 @@ socket.on('output', (data) => {
         // Handle backspace sequences - remove characters before \b
         processedData = processedData.replace(/.\x08/g, ''); // Remove char + backspace
         
+        // If cursor exists, move it after the new content
+        if (terminalCursor && terminalContent.innerHTML.indexOf(terminalCursor.outerHTML) !== -1) {
+            terminalContent.innerHTML = terminalContent.innerHTML.replace(terminalCursor.outerHTML, '');
+        }
+        
         terminalContent.innerHTML += processedData;
+        
+        // Add cursor at the end
+        if (terminalCursor) {
+            terminalContent.appendChild(terminalCursor);
+        }
+        
         terminal.scrollTop = terminal.scrollHeight;
         
         // Show terminal and hide disconnected state
@@ -270,11 +284,16 @@ terminalInput.addEventListener('input', (e) => {
     }
     
     const currentValue = terminalInput.value;
+    const terminalCursor = document.getElementById('terminalCursor');
     
     // If value increased, user typed a character - show it immediately
     if (currentValue.length > lastInputValue.length) {
         const newChars = currentValue.slice(lastInputValue.length);
         if (terminalContent && newChars) {
+            // Remove cursor temporarily
+            if (terminalCursor && terminalContent.innerHTML.indexOf(terminalCursor.outerHTML) !== -1) {
+                terminalContent.innerHTML = terminalContent.innerHTML.replace(terminalCursor.outerHTML, '');
+            }
             // Escape HTML and add to terminal
             const escapedChars = newChars
                 .replace(/&/g, '&amp;')
@@ -282,6 +301,10 @@ terminalInput.addEventListener('input', (e) => {
                 .replace(/>/g, '&gt;')
                 .replace(/\n/g, '<br>');
             terminalContent.innerHTML += escapedChars;
+            // Add cursor back at the end
+            if (terminalCursor) {
+                terminalContent.appendChild(terminalCursor);
+            }
             terminal.scrollTop = terminal.scrollHeight;
         }
     } else if (currentValue.length < lastInputValue.length) {
@@ -290,6 +313,10 @@ terminalInput.addEventListener('input', (e) => {
         if (terminalContent) {
             const charsToRemove = lastInputValue.length - currentValue.length;
             let content = terminalContent.innerHTML;
+            // Remove cursor temporarily
+            if (terminalCursor && content.indexOf(terminalCursor.outerHTML) !== -1) {
+                content = content.replace(terminalCursor.outerHTML, '');
+            }
             // Remove last N characters (handling HTML entities)
             for (let i = 0; i < charsToRemove; i++) {
                 // Remove last character, handling HTML entities and <br>
@@ -306,6 +333,10 @@ terminalInput.addEventListener('input', (e) => {
                 }
             }
             terminalContent.innerHTML = content;
+            // Add cursor back at the end
+            if (terminalCursor) {
+                terminalContent.appendChild(terminalCursor);
+            }
             terminal.scrollTop = terminal.scrollHeight;
         }
     }
@@ -326,13 +357,22 @@ terminalInput.addEventListener('keydown', (e) => {
     // Handle special keys
     if (e.key === 'Enter') {
         keyToSend = '\r\n';
+        const terminalCursor = document.getElementById('terminalCursor');
         // Show the entered line before sending (if not already shown)
-        if (terminalContent && terminalInput.value && !terminalContent.innerHTML.endsWith(terminalInput.value)) {
+        if (terminalContent && terminalInput.value) {
+            // Remove cursor temporarily
+            if (terminalCursor && terminalContent.innerHTML.indexOf(terminalCursor.outerHTML) !== -1) {
+                terminalContent.innerHTML = terminalContent.innerHTML.replace(terminalCursor.outerHTML, '');
+            }
             const escapedValue = terminalInput.value
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;');
             terminalContent.innerHTML += escapedValue + '<br>';
+            // Add cursor back at the end
+            if (terminalCursor) {
+                terminalContent.appendChild(terminalCursor);
+            }
             terminal.scrollTop = terminal.scrollHeight;
         }
         // Clear input field after a moment (let browser handle it naturally)

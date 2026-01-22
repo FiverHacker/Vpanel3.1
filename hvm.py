@@ -4294,17 +4294,20 @@ def start_shell(data):
     # Use docker exec with subprocess for cross-platform compatibility
     try:
         # Try bash first, fallback to sh if bash doesn't exist
+        # Use interactive mode with proper environment
         process = None
         for shell in ['/bin/bash', '/bin/sh', 'bash', 'sh']:
             try:
+                # Start shell in interactive mode with proper environment
                 process = subprocess.Popen(
-                    ['docker', 'exec', '-i', '-t', vps['container_id'], shell],
+                    ['docker', 'exec', '-i', '-t', vps['container_id'], shell, '-i'],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
-                    universal_newlines=True
+                    universal_newlines=True,
+                    env=None  # Use container's environment
                 )
                 # Test if process started successfully
                 if process.poll() is None:
@@ -4326,14 +4329,23 @@ def start_shell(data):
         # Send initial connection message
         emit('output', '\r\n\x1b[32m✓ Connected to container console...\x1b[0m\r\n')
         
-        # Trigger shell prompt by sending a newline after a short delay
+        # Trigger shell prompt by sending commands to initialize and show prompt
         def trigger_prompt():
-            time.sleep(0.3)
+            time.sleep(0.5)  # Give shell time to initialize
             if sid in console_sessions and console_sessions[sid].get('process'):
                 try:
                     proc = console_sessions[sid]['process']
                     if proc and proc.stdin and proc.poll() is None:
+                        # Set up a proper prompt (simple and visible)
+                        proc.stdin.write('export PS1="\\u@\\h:\\w\\$ "\n')  # user@host:path$ prompt
+                        proc.stdin.flush()
+                        time.sleep(0.3)
+                        # Send a newline to trigger prompt display
                         proc.stdin.write('\n')
+                        proc.stdin.flush()
+                        # Also ensure we're in home directory and show prompt
+                        time.sleep(0.2)
+                        proc.stdin.write('cd ~\n')
                         proc.stdin.flush()
                 except Exception as e:
                     logger.debug(f"Could not trigger prompt: {e}")
