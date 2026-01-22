@@ -119,9 +119,17 @@
                         <span class="font-medium">VPS OS:</span>
                         <code class="bg-gray-100 px-2 py-1 rounded">{{ vps.os_image }}</code>
                     </div>
+                    {% if vps.public_ip %}
+                    <div class="flex justify-between items-center p-3 bg-green-50 rounded border border-green-200">
+                        <span class="font-medium text-green-800">
+                            <i class="fas fa-globe mr-2"></i>Public IPv4:
+                        </span>
+                        <code class="bg-green-100 px-2 py-1 rounded text-green-800 font-bold">{{ vps.public_ip }}</code>
+                    </div>
+                    {% endif %}
                     <div class="flex justify-between items-center p-3 bg-gray-50 rounded">
                         <span class="font-medium">SSH Host:</span>
-                        <code class="bg-gray-100 px-2 py-1 rounded">{{ server_ip }}</code>
+                        <code class="bg-gray-100 px-2 py-1 rounded">{{ vps.public_ip if vps.public_ip else server_ip }}</code>
                     </div>
                     <div class="flex justify-between items-center p-3 bg-gray-50 rounded">
                         <span class="font-medium">SSH Port:</span>
@@ -133,8 +141,23 @@
                     </div>
                     <div class="flex justify-between items-center p-3 bg-gray-50 rounded">
                         <span class="font-medium">SSH Command:</span>
-                        <code class="bg-gray-100 px-2 py-1 rounded text-xs">ssh root@{{ server_ip }} -p {{ vps.port }}</code>
+                        <code class="bg-gray-100 px-2 py-1 rounded text-xs">
+                            {% if vps.public_ip %}
+                            ssh root@{{ vps.public_ip }} -p 22
+                            {% else %}
+                            ssh root@{{ server_ip }} -p {{ vps.port }}
+                            {% endif %}
+                        </code>
                     </div>
+                    {% if vps.public_ip %}
+                    <div class="p-3 bg-blue-50 rounded border border-blue-200">
+                        <p class="text-sm text-blue-800">
+                            <i class="fas fa-info-circle mr-2"></i>
+                            <strong>Note:</strong> SSH is accessible directly on the public IP ({{ vps.public_ip }}) using port 22. 
+                            The tunnel system automatically routes traffic to your VPS container.
+                        </p>
+                    </div>
+                    {% endif %}
                     {% if vps.tmate_session %}
                     <div class="flex justify-between items-center p-3 bg-gray-50 rounded">
                         <span class="font-medium">Tmate Session:</span>

@@ -141,7 +141,7 @@ load_dotenv()
 SECRET_KEY = os.getenv('SECRET_KEY', ''.join(random.choices(string.ascii_letters + string.digits, k=32)))
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin')
-PANEL_NAME = os.getenv('PANEL_NAME', 'HVM PANEL')
+PANEL_NAME = os.getenv('PANEL_NAME', 'apkhub cloud')
 WATERMARK = os.getenv('WATERMARK', 'HVM VPS Service')
 WELCOME_MESSAGE = os.getenv('WELCOME_MESSAGE', 'Welcome to HVM PANEL! Power Your Future!')
 MAX_VPS_PER_USER = int(os.getenv('MAX_VPS_PER_USER', '3'))
@@ -151,6 +151,11 @@ MAX_CONTAINERS = int(os.getenv('MAX_CONTAINERS', '100'))
 DB_FILE = 'hvm_panel.db'
 BACKUP_FILE = 'hvm_panel_backup.json'
 SERVER_IP = os.getenv('SERVER_IP', socket.gethostbyname(socket.gethostname()))
+# Tunnel/IP Configuration
+TUNNEL_ENABLED = os.getenv('TUNNEL_ENABLED', 'true').lower() == 'true'
+PUBLIC_IP_POOL_START = os.getenv('PUBLIC_IP_POOL_START', '10.0.0.2')
+PUBLIC_IP_POOL_END = os.getenv('PUBLIC_IP_POOL_END', '10.0.255.254')
+TUNNEL_INTERFACE = os.getenv('TUNNEL_INTERFACE', 'tun0')
 SERVER_PORT = int(os.getenv('SERVER_PORT', '3000'))
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 UPLOAD_FOLDER = 'uploads'
@@ -446,6 +451,9 @@ class Database:
         if 'tags' not in columns:
             self._execute('ALTER TABLE vps_instances ADD COLUMN tags TEXT DEFAULT ""')
        
+        if 'public_ip' not in columns:
+            self._execute('ALTER TABLE vps_instances ADD COLUMN public_ip TEXT')
+       
         user_columns = [col[1] for col in self._fetchall("PRAGMA table_info(users)")]
         if 'email' not in user_columns:
             self._execute('ALTER TABLE users ADD COLUMN email TEXT')
@@ -549,7 +557,7 @@ class Database:
 
     def get_user_vps_count(self, user_id):
         result = self._fetchone('SELECT COUNT(*) FROM vps_instances WHERE created_by = ?', (user_id,))
-        return result[0]
+        return result[0] if result else 0
 
     def get_user_vps(self, user_id):
         rows = self._fetchall('SELECT * FROM vps_instances WHERE created_by = ?', (user_id,))
@@ -847,6 +855,192 @@ except Exception as e:
     logger.error(f"Docker init failed: {e}")
     docker_client = None
 
+# Tunnel/IP Management Functions
+def ip_to_int(ip):
+    """Convert IP address to integer"""
+    parts = ip.split('.')
+    return int(parts[0]) * 256**3 + int(parts[1]) * 256**2 + int(parts[2]) * 256 + int(parts[3])
+
+def int_to_ip(ip_int):
+    """Convert integer to IP address"""
+    return f"{ip_int // 256**3}.{(ip_int // 256**2) % 256}.{(ip_int // 256) % 256}.{ip_int % 256}"
+
+def allocate_public_ip(vps_id):
+    """Allocate a public IP from the pool for a VPS"""
+    if not TUNNEL_ENABLED:
+        return None
+    
+    try:
+        # Get all currently used IPs
+        all_vps = db.get_all_vps()
+        used_ips = set()
+        for vps in all_vps.values():
+            if vps.get('public_ip'):
+                used_ips.add(vps['public_ip'])
+        
+        # Find next available IP in pool
+        start_int = ip_to_int(PUBLIC_IP_POOL_START)
+        end_int = ip_to_int(PUBLIC_IP_POOL_END)
+        
+        for ip_int in range(start_int, end_int + 1):
+            ip = int_to_ip(ip_int)
+            if ip not in used_ips:
+                return ip
+        
+        logger.error("No available IPs in pool")
+        return None
+    except Exception as e:
+        logger.error(f"IP allocation error: {e}")
+        return None
+
+def setup_tunnel(vps_id, public_ip, container_id):
+    """Set up tunnel/routing for public IP to container"""
+    if not TUNNEL_ENABLED or not public_ip:
+        return True
+    
+    try:
+        # Get container IP
+        container = docker_client.containers.get(container_id)
+        container.reload()
+        network_settings = container.attrs.get('NetworkSettings', {})
+        networks = network_settings.get('Networks', {})
+        
+        if DOCKER_NETWORK not in networks:
+            logger.error(f"Container {container_id} not in network {DOCKER_NETWORK}")
+            return False
+        
+        container_ip = networks[DOCKER_NETWORK].get('IPAddress')
+        if not container_ip:
+            logger.error(f"Could not get container IP for {container_id}")
+            return False
+        
+        # Set up NAT rules using iptables (requires root/sudo)
+        # Forward traffic from public IP to container IP
+        if sys.platform != "win32":
+            try:
+                # Add DNAT rule to forward all traffic from public IP to container IP
+                subprocess.run([
+                    'iptables', '-t', 'nat', '-A', 'PREROUTING',
+                    '-d', public_ip, '-j', 'DNAT', '--to-destination', container_ip
+                ], check=True, capture_output=True)
+                
+                # Add SNAT rule for return traffic
+                subprocess.run([
+                    'iptables', '-t', 'nat', '-A', 'POSTROUTING',
+                    '-s', container_ip, '-j', 'SNAT', '--to-source', public_ip
+                ], check=True, capture_output=True)
+                
+                # Add firewall rule to allow SSH (port 22) on public IP
+                subprocess.run([
+                    'iptables', '-A', 'INPUT',
+                    '-d', public_ip, '-p', 'tcp', '--dport', '22', '-j', 'ACCEPT'
+                ], check=True, capture_output=True)
+                
+                # Add firewall rule to allow all traffic to public IP (for other services)
+                subprocess.run([
+                    'iptables', '-A', 'INPUT',
+                    '-d', public_ip, '-j', 'ACCEPT'
+                ], check=True, capture_output=True)
+                
+                # Add forwarding rule
+                subprocess.run([
+                    'iptables', '-A', 'FORWARD',
+                    '-d', container_ip, '-j', 'ACCEPT'
+                ], check=True, capture_output=True)
+                
+                subprocess.run([
+                    'iptables', '-A', 'FORWARD',
+                    '-s', container_ip, '-j', 'ACCEPT'
+                ], check=True, capture_output=True)
+                
+                logger.info(f"Tunnel setup complete: {public_ip} -> {container_ip} (VPS {vps_id})")
+                logger.info(f"SSH enabled on {public_ip}:22")
+                return True
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"iptables setup failed (may need root): {e}")
+                # Continue anyway - routing might be handled by Docker
+                return True
+            except FileNotFoundError:
+                logger.warning("iptables not found - tunnel routing may not work")
+                return True
+        else:
+            # Windows - use netsh or Docker port mapping
+            logger.info(f"Tunnel configured: {public_ip} -> {container_ip} (VPS {vps_id})")
+            return True
+    except Exception as e:
+        logger.error(f"Tunnel setup error for VPS {vps_id}: {e}")
+        return False
+
+def cleanup_tunnel(vps_id, public_ip, container_id=None):
+    """Clean up tunnel/routing when VPS is deleted"""
+    if not TUNNEL_ENABLED or not public_ip:
+        return True
+    
+    try:
+        container_ip = None
+        if container_id and docker_client:
+            try:
+                container = docker_client.containers.get(container_id)
+                container.reload()
+                network_settings = container.attrs.get('NetworkSettings', {})
+                networks = network_settings.get('Networks', {})
+                if DOCKER_NETWORK in networks:
+                    container_ip = networks[DOCKER_NETWORK].get('IPAddress')
+            except:
+                pass
+        
+        if sys.platform != "win32":
+            try:
+                # Remove DNAT rules
+                subprocess.run([
+                    'iptables', '-t', 'nat', '-D', 'PREROUTING',
+                    '-d', public_ip, '-j', 'DNAT'
+                ], capture_output=True)
+                
+                # Remove SNAT rules (need to find matching rule)
+                result = subprocess.run([
+                    'iptables', '-t', 'nat', '-S', 'POSTROUTING'
+                ], capture_output=True, text=True)
+                
+                for line in result.stdout.split('\n'):
+                    if public_ip in line:
+                        subprocess.run([
+                            'iptables', '-t', 'nat', '-D', 'POSTROUTING'
+                        ] + line.split()[2:], capture_output=True)
+                
+                # Remove firewall rules for public IP
+                subprocess.run([
+                    'iptables', '-D', 'INPUT',
+                    '-d', public_ip, '-p', 'tcp', '--dport', '22', '-j', 'ACCEPT'
+                ], capture_output=True)
+                
+                subprocess.run([
+                    'iptables', '-D', 'INPUT',
+                    '-d', public_ip, '-j', 'ACCEPT'
+                ], capture_output=True)
+                
+                # Remove forwarding rules if we have container IP
+                if container_ip:
+                    result = subprocess.run([
+                        'iptables', '-S', 'FORWARD'
+                    ], capture_output=True, text=True)
+                    
+                    for line in result.stdout.split('\n'):
+                        if container_ip in line:
+                            parts = line.split()
+                            if '-A' in parts:
+                                parts[parts.index('-A')] = '-D'
+                                subprocess.run(['iptables'] + parts, capture_output=True)
+                
+                logger.info(f"Tunnel cleanup complete for {public_ip} (VPS {vps_id})")
+            except Exception as e:
+                logger.warning(f"Tunnel cleanup warning: {e}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Tunnel cleanup error for VPS {vps_id}: {e}")
+        return False
+
 system_stats = {}
 vps_stats_cache = {}
 console_sessions = {}
@@ -939,7 +1133,7 @@ def update_vps_stats():
                 net_stats = stats.get('networks', {})
                 mem_usage = mem_stats.get('usage', 0) / (1024 ** 2)
                 mem_limit = mem_stats.get('limit', 1) / (1024 ** 2)
-                cpu_usage = (cpu_stats['cpu_usage']['total_usage'] / cpu_stats['system_cpu_usage']) * 100 if cpu_stats.get('system_cpu_usage') else 0
+                cpu_usage = (cpu_stats['cpu_usage']['total_usage'] / cpu_stats['system_cpu_usage']) * 100 if cpu_stats.get('system_cpu_usage') and cpu_stats['system_cpu_usage'] > 0 else 0
                 net_in = sum(iface['rx_bytes'] for iface in net_stats.values()) / (1024 ** 2)
                 net_out = sum(iface['tx_bytes'] for iface in net_stats.values()) / (1024 ** 2)
                 uptime_start = datetime.datetime.fromisoformat(vps['uptime_start'])
@@ -950,7 +1144,7 @@ def update_vps_stats():
                 disk_usage = psutil.disk_usage(f'/var/lib/docker/volumes/hvm-{vps_id}/_data').percent if os.path.exists(f'/var/lib/docker/volumes/hvm-{vps_id}/_data') else 0
                 vps_stats_cache[vps_id] = {
                     'cpu_percent': round(cpu_usage, 2),
-                    'memory_percent': round((mem_usage / mem_limit) * 100, 2),
+                    'memory_percent': round((mem_usage / mem_limit) * 100, 2) if mem_limit > 0 else 0,
                     'net_in_mb': round(net_in, 2),
                     'net_out_mb': round(net_out, 2),
                     'disk_percent': round(disk_usage, 2),
@@ -958,7 +1152,7 @@ def update_vps_stats():
                     'uptime_seconds': uptime_seconds,
                     'uptime_percent': round(uptime_percent, 2)
                 }
-                db.add_resource_history(vps_id, cpu_usage, (mem_usage / mem_limit * 100), disk_usage, net_in, net_out)
+                db.add_resource_history(vps_id, cpu_usage, (mem_usage / mem_limit * 100) if mem_limit > 0 else 0, disk_usage, net_in, net_out)
                 resource_history[vps_id].append(vps_stats_cache[vps_id])
                 socketio.emit('vps_update', vps_stats_cache[vps_id], room=vps_id, namespace='/vps')
             except Exception as e:
@@ -1042,6 +1236,15 @@ def setup_container(container_id, memory, vps_id, ssh_port, root_password, water
         if not success:
             logger.warning(f"Watermark set failed: {stderr}")
        
+        # Configure SSH to listen on all interfaces (0.0.0.0) to accept connections via public IP
+        ssh_config_cmd = "sed -i 's/#ListenAddress 0.0.0.0/ListenAddress 0.0.0.0/' /etc/ssh/sshd_config && " \
+                        "sed -i 's/ListenAddress /#ListenAddress /' /etc/ssh/sshd_config && " \
+                        "echo 'ListenAddress 0.0.0.0' >> /etc/ssh/sshd_config && " \
+                        "systemctl restart ssh || systemctl restart sshd"
+        success, _, stderr = run_docker_command(container_id, ["bash", "-c", ssh_config_cmd])
+        if not success:
+            logger.warning(f"SSH config update failed: {stderr}")
+        
         security_cmds = [
             "systemctl enable fail2ban && systemctl start fail2ban",
             "apt-get update && apt-get upgrade -y",
@@ -1050,7 +1253,8 @@ def setup_container(container_id, memory, vps_id, ssh_port, root_password, water
             "apt-get -y autoremove",
             "apt-get clean",
             "chmod 700 /root",
-            "systemctl enable prometheus-node-exporter && systemctl start prometheus-node-exporter"
+            "systemctl enable prometheus-node-exporter && systemctl start prometheus-node-exporter",
+            "systemctl enable ssh && systemctl start ssh || systemctl enable sshd && systemctl start sshd"
         ]
         for cmd in security_cmds:
             success, _, stderr = run_docker_command(container_id, ["bash", "-c", cmd])
@@ -1069,9 +1273,11 @@ def get_tmate_session(container_id):
         session = None
         while time.time() - start < 10:
             line = process.stdout.readline()
-            if "ssh session:" in line:
-                session = line.split("ssh session:")[1].strip()
-                break
+            if line and "ssh session:" in line:
+                parts = line.split("ssh session:")
+                if len(parts) > 1:
+                    session = parts[1].strip()
+                    break
         process.terminate()
         return session
     except Exception as e:
@@ -1256,9 +1462,9 @@ def create_vps():
 
     if request.method == 'POST':
         try:
-            memory = int(request.form['memory'])
-            cpu = int(request.form['cpu'])
-            disk = int(request.form['disk'])
+            memory = int(request.form.get('memory', 0))
+            cpu = int(request.form.get('cpu', 0))
+            disk = int(request.form.get('disk', 0))
             os_image = request.form.get('os_image', DEFAULT_OS_IMAGE)
             additional_ports = request.form.get('additional_ports', '')
             expires_days = int(request.form.get('expires_days', 30))
@@ -1292,8 +1498,11 @@ def create_vps():
             for v in db.get_all_vps().values():
                 used_ports.add(v['port'])
                 for p in v.get('additional_ports', '').split(','):
-                    if p:
-                        used_ports.add(int(p.split(':')[0]))
+                    if p and ':' in p:
+                        try:
+                            used_ports.add(int(p.split(':')[0]))
+                        except (ValueError, IndexError):
+                            pass  # Skip invalid port formats
 
             ssh_port = random.randint(20000, 30000)
             while ssh_port in used_ports:
@@ -1302,8 +1511,15 @@ def create_vps():
             ports = {'22/tcp': ssh_port}
             for port_str in additional_ports.split(','):
                 if port_str.strip():
-                    host, cont = port_str.strip().split(':')
-                    host_p = int(host)
+                    port_parts = port_str.strip().split(':')
+                    if len(port_parts) != 2:
+                        raise ValueError(f"Invalid port format: '{port_str.strip()}'. Expected format: 'host_port:container_port' (e.g., '8080:80')")
+                    host, cont = port_parts
+                    try:
+                        host_p = int(host)
+                        int(cont)  # Validate container port is a number
+                    except ValueError:
+                        raise ValueError(f"Invalid port number in '{port_str.strip()}'. Ports must be integers.")
                     if host_p in used_ports:
                         raise ValueError(f"Port {host_p} in use")
                     ports[f'{cont}/tcp'] = host_p
@@ -1338,10 +1554,35 @@ def create_vps():
             time.sleep(5)
             container.reload()
 
+            # Allocate and set up public IP tunnel
+            public_ip = allocate_public_ip(vps_id)
+            if public_ip:
+                tunnel_success = setup_tunnel(vps_id, public_ip, container.id)
+                if not tunnel_success:
+                    logger.warning(f"Tunnel setup failed for VPS {vps_id}, continuing without public IP")
+                    public_ip = None
+            else:
+                logger.warning(f"Could not allocate public IP for VPS {vps_id}")
+
             watermark = db.get_setting('watermark', WATERMARK)
             welcome = db.get_setting('welcome_message', WELCOME_MESSAGE)
             setup_success, _ = setup_container(container.id, memory, vps_id, ssh_port, root_password, watermark, welcome)
+            
+            # If public IP is set, ensure SSH is accessible on it
+            if public_ip and setup_success:
+                # Wait a bit for SSH to be ready
+                time.sleep(2)
+                # Verify SSH is running
+                ssh_check = run_docker_command(container.id, ["systemctl", "is-active", "ssh"])
+                if not ssh_check[0]:
+                    ssh_check = run_docker_command(container.id, ["systemctl", "is-active", "sshd"])
+                if ssh_check[0]:
+                    logger.info(f"SSH is active and accessible on {public_ip}:22 for VPS {vps_id}")
+                else:
+                    logger.warning(f"SSH may not be active on VPS {vps_id}")
             if not setup_success:
+                if public_ip:
+                    cleanup_tunnel(vps_id, public_ip, container.id)
                 container.stop()
                 container.remove()
                 raise Exception('Setup failed')
@@ -1378,7 +1619,8 @@ def create_vps():
                 'expires_minutes': expires_minutes,
                 'additional_ports': additional_ports,
                 'uptime_start': str(now),
-                'tags': tags
+                'tags': tags,
+                'public_ip': public_ip
             }
 
             if db.add_vps(vps_data):
@@ -1396,6 +1638,8 @@ def create_vps():
                     theme=current_user.theme
                 )
             else:
+                if public_ip:
+                    cleanup_tunnel(vps_id, public_ip, container.id)
                 container.stop()
                 container.remove()
                 raise Exception('DB add failed')
@@ -1461,8 +1705,14 @@ def edit_vps(vps_id):
                 ports = {'22/tcp': vps['port']}
                 for p in new_ports.split(','):
                     if p.strip():
-                        h, c = p.strip().split(':')
-                        ports[f'{c}/tcp'] = int(h)
+                        port_parts = p.strip().split(':')
+                        if len(port_parts) != 2:
+                            raise ValueError(f"Invalid port format: '{p.strip()}'. Expected format: 'host_port:container_port' (e.g., '8080:80')")
+                        h, c = port_parts
+                        try:
+                            ports[f'{c}/tcp'] = int(h)
+                        except ValueError:
+                            raise ValueError(f"Invalid port number in '{p.strip()}'. Ports must be integers.")
                
                 cpuset = f"0-{new_cpu-1}" if new_cpu > 1 else "0"
                 prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
@@ -1621,6 +1871,10 @@ def delete_vps(vps_id):
         return jsonify({'error': 'Access denied'}), 403
    
     try:
+        # Clean up tunnel if public IP exists
+        if vps.get('public_ip'):
+            cleanup_tunnel(vps_id, vps['public_ip'], vps.get('container_id'))
+        
         container = docker_client.containers.get(vps['container_id'])
         container.stop()
         container.remove()
@@ -1668,7 +1922,10 @@ def clone_vps(vps_id):
             container.pause()
        
         new_image_tag = f"hvm/clone-{generate_vps_id().lower()}:latest"
-        new_image = container.commit(repository=new_image_tag.split(':')[0], tag=new_image_tag.split(':')[1])
+        image_parts = new_image_tag.split(':')
+        repository = image_parts[0] if len(image_parts) > 0 else new_image_tag
+        tag = image_parts[1] if len(image_parts) > 1 else 'latest'
+        new_image = container.commit(repository=repository, tag=tag)
        
         if was_running:
             container.unpause()
@@ -1680,8 +1937,11 @@ def clone_vps(vps_id):
         used_ports = set(v['port'] for v in db.get_all_vps().values())
         for v in db.get_all_vps().values():
             for p in v.get('additional_ports', '').split(','):
-                if p:
-                    used_ports.add(int(p.split(':')[0]))
+                if p and ':' in p:
+                    try:
+                        used_ports.add(int(p.split(':')[0]))
+                    except (ValueError, IndexError):
+                        pass  # Skip invalid port formats
        
         new_ssh_port = random.randint(20000, 30000)
         while new_ssh_port in used_ports:
@@ -1691,10 +1951,13 @@ def clone_vps(vps_id):
         new_additional = ''
         for p in vps['additional_ports'].split(','):
             if p.strip():
+                port_parts = p.split(':')
+                if len(port_parts) != 2:
+                    continue  # Skip invalid port formats
+                c = port_parts[1]
                 h = random.randint(30001, 40000)
                 while h in used_ports:
                     h = random.randint(30001, 40000)
-                c = p.split(':')[1]
                 ports[f'{c}/tcp'] = h
                 new_additional += f",{h}:{c}" if new_additional else f"{h}:{c}"
        
@@ -1852,7 +2115,7 @@ def vps_stats(vps_id):
        
         mem_usage = mem_stats.get('usage', 0) / (1024 ** 2)
         mem_limit = mem_stats.get('limit', 1) / (1024 ** 2)
-        cpu_usage = (cpu_stats['cpu_usage']['total_usage'] / cpu_stats['system_cpu_usage']) * len(cpu_stats['cpu_usage']['percpu_usage']) if 'system_cpu_usage' in cpu_stats else 0
+        cpu_usage = (cpu_stats['cpu_usage']['total_usage'] / cpu_stats['system_cpu_usage']) * len(cpu_stats['cpu_usage']['percpu_usage']) if 'system_cpu_usage' in cpu_stats and cpu_stats['system_cpu_usage'] > 0 else 0
        
         disk_read = sum(s['value'] for s in blkio.get('io_service_bytes_recursive', []) if s['op'] == 'Read') / (1024 ** 2)
         disk_write = sum(s['value'] for s in blkio.get('io_service_bytes_recursive', []) if s['op'] == 'Write') / (1024 ** 2)
@@ -1876,7 +2139,7 @@ def vps_stats(vps_id):
         metrics = out if success else ''
        
         return jsonify({
-            'memory': {'used_mb': round(mem_usage, 2), 'limit_mb': round(mem_limit, 2), 'percent': round(mem_usage / mem_limit * 100, 2)},
+            'memory': {'used_mb': round(mem_usage, 2), 'limit_mb': round(mem_limit, 2), 'percent': round(mem_usage / mem_limit * 100, 2) if mem_limit > 0 else 0},
             'cpu': {'percent': round(cpu_usage, 2)},
             'disk': {'read_mb': round(disk_read, 2), 'write_mb': round(disk_write, 2), 'total_gb': vps['disk']},
             'network': {'in_mb': round(net_in, 2), 'out_mb': round(net_out, 2)},
@@ -1929,10 +2192,10 @@ def upgrade_vps(vps_id):
         return jsonify({'error': 'Not found'}), 404
    
     try:
-        new_memory = int(request.form['memory'])
-        new_cpu = int(request.form['cpu'])
-        new_disk = int(request.form['disk'])
-        new_bandwidth = int(request.form['bandwidth_limit'])
+        new_memory = int(request.form.get('memory', 0))
+        new_cpu = int(request.form.get('cpu', 0))
+        new_disk = int(request.form.get('disk', 0))
+        new_bandwidth = int(request.form.get('bandwidth_limit', 0))
        
         if new_memory < 1 or new_memory > 512 or new_cpu < 1 or new_cpu > 32 or new_disk < 10 or new_disk > 1000:
             return jsonify({'error': 'Invalid values'}), 400
@@ -1946,8 +2209,14 @@ def upgrade_vps(vps_id):
         ports = {'22/tcp': vps['port']}
         for p in vps['additional_ports'].split(','):
             if p.strip():
-                h, c = p.split(':')
-                ports[f'{c}/tcp'] = int(h)
+                port_parts = p.split(':')
+                if len(port_parts) != 2:
+                    continue  # Skip invalid port formats
+                h, c = port_parts
+                try:
+                    ports[f'{c}/tcp'] = int(h)
+                except ValueError:
+                    continue  # Skip invalid port numbers
        
         cpuset = f"0-{new_cpu-1}" if new_cpu > 1 else "0"
         prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
@@ -2069,8 +2338,11 @@ def add_vps_port(vps_id):
     for v in db.get_all_vps().values():
         used_ports.add(v['port'])
         for p in v.get('additional_ports', '').split(','):
-            if p:
-                used_ports.add(int(p.split(':')[0]))
+            if p and ':' in p:
+                try:
+                    used_ports.add(int(p.split(':')[0]))
+                except (ValueError, IndexError):
+                    pass  # Skip invalid port formats
    
     if host_p in used_ports:
         return jsonify({'error': 'Port in use'}), 400
@@ -2085,8 +2357,14 @@ def add_vps_port(vps_id):
         ports = {'22/tcp': vps['port']}
         for p in vps['additional_ports'].split(','):
             if p.strip():
-                h, c = p.split(':')
-                ports[f'{c}/tcp'] = int(h)
+                port_parts = p.split(':')
+                if len(port_parts) != 2:
+                    continue  # Skip invalid port formats
+                h, c = port_parts
+                try:
+                    ports[f'{c}/tcp'] = int(h)
+                except ValueError:
+                    continue  # Skip invalid port numbers
        
         ports[f'{cont_port}/{protocol}'] = host_p
        
@@ -2151,10 +2429,16 @@ def remove_vps_port(vps_id):
         new_additional = []
         for p in vps['additional_ports'].split(','):
             if p.strip():
-                h, c = p.split(':')
-                if h != host_port:
-                    ports[f'{c}/tcp'] = int(h)
-                    new_additional.append(f"{h}:{c}")
+                port_parts = p.split(':')
+                if len(port_parts) != 2:
+                    continue  # Skip invalid port formats
+                h, c = port_parts
+                try:
+                    if h != host_port:
+                        ports[f'{c}/tcp'] = int(h)
+                        new_additional.append(f"{h}:{c}")
+                except ValueError:
+                    continue  # Skip invalid port numbers
        
         cpuset = f"0-{vps['cpu']-1}" if vps['cpu'] > 1 else "0"
         prefix = db.get_setting('vps_hostname_prefix', VPS_HOSTNAME_PREFIX)
@@ -2379,7 +2663,7 @@ def vps_users(vps_id):
             return jsonify({'success': success, 'output': out, 'error': err})
    
     success, out, err = run_docker_command(vps['container_id'], ["cat", "/etc/passwd"])
-    users = [line.split(':')[0] for line in out.splitlines() if success]
+    users = [line.split(':')[0] for line in out.splitlines() if success and line and ':' in line]
     return render_template('vps_users.html', vps=vps, users=users, panel_name=db.get_setting('panel_name', PANEL_NAME), theme=current_user.theme)
 
 @app.route('/vps/<vps_id>/cron', methods=['GET', 'POST'])
@@ -2484,7 +2768,8 @@ def referral():
     code = db.get_referral_code(current_user.id)
     if not code:
         code = db.generate_referral_code(current_user.id)
-    referred = db._fetchone('SELECT referred_users FROM referrals WHERE user_id = ?', (current_user.id,))[0]
+    result = db._fetchone('SELECT referred_users FROM referrals WHERE user_id = ?', (current_user.id,))
+    referred = result[0] if result and len(result) > 0 else 0
     return render_template('referral.html', code=code, referred=referred, panel_name=db.get_setting('panel_name', PANEL_NAME), theme=current_user.theme)
 
 @app.route('/admin/groups', methods=['GET', 'POST'])
@@ -2492,7 +2777,9 @@ def referral():
 @admin_required
 def manage_groups():
     if request.method == 'POST':
-        name = request.form['name']
+        name = request.form.get('name', '').strip()
+        if not name:
+            return render_template('groups.html', groups=db.get_groups(), error='Group name is required', panel_name=db.get_setting('panel_name', PANEL_NAME), theme=current_user.theme)
         desc = request.form.get('description', '')
         db.add_group(name, desc)
         db.log_action(current_user.id, 'add_group', f'Added group {name}')
@@ -2505,7 +2792,9 @@ def manage_groups():
 @login_required
 @admin_required
 def assign_group(group_id):
-    vps_id = request.form['vps_id']
+    vps_id = request.form.get('vps_id')
+    if not vps_id:
+        return jsonify({'error': 'VPS ID is required'}), 400
     db.assign_vps_to_group(group_id, vps_id)
     db.log_action(current_user.id, 'assign_group', f'Assigned VPS {vps_id} to group {group_id}')
     return redirect(url_for('admin_panel'))
@@ -2568,10 +2857,13 @@ def admin_settings():
 @admin_required
 def add_user():
     if request.method == 'POST':
-        username = request.form['username'].strip()
-        password = request.form['password']
-        email = request.form['email'].strip()
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        email = request.form.get('email', '').strip()
         role = request.form.get('role', 'user')
+        
+        if not username or not password:
+            return render_template('add_user.html', error='Username and password are required', panel_name=db.get_setting('panel_name', PANEL_NAME), theme=current_user.theme)
         if len(password) < 8:
             return render_template('add_user.html', error='Password too short', panel_name=db.get_setting('panel_name', PANEL_NAME), theme=current_user.theme)
         if db.create_user(username, password, role, email):

@@ -120,6 +120,14 @@
                 </div>
                 
                 <div class="space-y-2 text-sm">
+                    {% if vps.public_ip %}
+                    <div class="flex justify-between items-center p-2 bg-green-50 rounded border border-green-200">
+                        <span class="text-green-800 font-medium">
+                            <i class="fas fa-globe mr-1"></i>Public IP:
+                        </span>
+                        <code class="text-green-800 font-bold">{{ vps.public_ip }}</code>
+                    </div>
+                    {% endif %}
                     <div class="flex justify-between">
                         <span class="text-gray-600">Memory:</span>
                         <span>{{ vps.memory }} GB</span>
